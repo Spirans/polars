@@ -42,10 +42,9 @@ where
         let (left, filter) = align_chunks_binary(self, filter);
 
         let chunks = left
-            .downcast_chunks()
-            .iter()
-            .zip(filter.downcast_chunks())
-            .map(|(&left, mask)| filter_fn(left, mask).unwrap())
+            .downcast_iter()
+            .zip(filter.downcast_iter())
+            .map(|(left, mask)| filter_fn(left, mask).unwrap())
             .collect::<Vec<_>>();
         Ok(ChunkedArray::new_from_chunks(self.name(), chunks))
     }
@@ -64,10 +63,9 @@ impl ChunkFilter<BooleanType> for BooleanChunked {
         let (left, filter) = align_chunks_binary(self, filter);
 
         let chunks = left
-            .downcast_chunks()
-            .iter()
-            .zip(filter.downcast_chunks())
-            .map(|(&left, mask)| filter_fn(left, mask).unwrap())
+            .downcast_iter()
+            .zip(filter.downcast_iter())
+            .map(|(left, mask)| filter_fn(left, mask).unwrap())
             .collect::<Vec<_>>();
         Ok(ChunkedArray::new_from_chunks(self.name(), chunks))
     }
@@ -79,17 +77,16 @@ impl ChunkFilter<Utf8Type> for Utf8Chunked {
         if filter.len() == 1 {
             return match filter.get(0) {
                 Some(true) => Ok(self.clone()),
-                _ => self.slice(0, 0),
+                _ => Ok(self.slice(0, 0)),
             };
         }
         check_filter_len!(self, filter);
         let (left, filter) = align_chunks_binary(self, filter);
 
         let chunks = left
-            .downcast_chunks()
-            .iter()
-            .zip(filter.downcast_chunks())
-            .map(|(&left, mask)| filter_fn(left, mask).unwrap())
+            .downcast_iter()
+            .zip(filter.downcast_iter())
+            .map(|(left, mask)| filter_fn(left, mask).unwrap())
             .collect::<Vec<_>>();
         Ok(ChunkedArray::new_from_chunks(self.name(), chunks))
     }
@@ -111,16 +108,15 @@ impl ChunkFilter<ListType> for ListChunked {
         if filter.len() == 1 {
             return match filter.get(0) {
                 Some(true) => Ok(self.clone()),
-                _ => self.slice(0, 0),
+                _ => Ok(self.slice(0, 0)),
             };
         }
         let (left, filter) = align_chunks_binary(self, filter);
 
         let chunks = left
-            .downcast_chunks()
-            .iter()
-            .zip(filter.downcast_chunks())
-            .map(|(&left, mask)| filter_fn(left, mask).unwrap())
+            .downcast_iter()
+            .zip(filter.downcast_iter())
+            .map(|(left, mask)| filter_fn(left, mask).unwrap())
             .collect::<Vec<_>>();
         Ok(ChunkedArray::new_from_chunks(self.name(), chunks))
     }
@@ -147,7 +143,7 @@ where
                 "cannot filter empty object array".into(),
             ));
         }
-        let chunks = self.downcast_chunks();
+        let chunks = self.downcast_iter().collect::<Vec<_>>();
         let mut builder = ObjectChunkedBuilder::<T>::new(self.name(), self.len());
         for (idx, mask) in filter.into_iter().enumerate() {
             if mask.unwrap_or(false) {

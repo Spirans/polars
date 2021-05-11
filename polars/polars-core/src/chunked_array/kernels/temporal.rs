@@ -1,30 +1,30 @@
-use crate::chunked_array::{
-    builder::{build_with_existing_null_bitmap_and_slice, get_bitmap},
-    temporal::conversions_utils::*,
-};
+use crate::chunked_array::{builder::get_bitmap, temporal::conversions_utils::*};
 use crate::prelude::*;
 use arrow::array::{ArrayRef, PrimitiveArray};
-use chrono::{Datelike, Timelike};
+use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use std::sync::Arc;
 
-pub fn date32_as_duration(arr: &PrimitiveArray<Date32Type>) -> ArrayRef {
-    let vals = arr.values();
-    let (_null_count, null_bit_buffer) = get_bitmap(arr);
-
-    let av = vals
-        .iter()
-        .map(|days| (days * 3600 * 24 * 1000) as i64)
-        .collect::<AlignedVec<_>>();
-
-    Arc::new(av.into_primitive_array::<DurationMillisecondType>(null_bit_buffer))
+trait PolarsWeekDay {
+    fn p_weekday(&self) -> u32;
+    fn week(&self) -> u32;
 }
 
-pub fn date64_as_duration(arr: &PrimitiveArray<Date64Type>) -> ArrayRef {
-    let vals = arr.values();
-    let (null_count, null_bit_buffer) = get_bitmap(arr);
-    Arc::new(build_with_existing_null_bitmap_and_slice::<
-        DurationMillisecondType,
-    >(null_bit_buffer, null_count, vals))
+impl PolarsWeekDay for NaiveDateTime {
+    fn p_weekday(&self) -> u32 {
+        self.weekday() as u32
+    }
+    fn week(&self) -> u32 {
+        self.iso_week().week()
+    }
+}
+
+impl PolarsWeekDay for NaiveDate {
+    fn p_weekday(&self) -> u32 {
+        self.weekday() as u32
+    }
+    fn week(&self) -> u32 {
+        self.iso_week().week()
+    }
 }
 
 macro_rules! to_temporal_unit {
@@ -43,7 +43,20 @@ macro_rules! to_temporal_unit {
         }
     };
 }
-
+to_temporal_unit!(
+    date32_to_week,
+    week,
+    date32_as_datetime,
+    Date32Type,
+    UInt32Type
+);
+to_temporal_unit!(
+    date32_to_weekday,
+    p_weekday,
+    date32_as_datetime,
+    Date32Type,
+    UInt32Type
+);
 to_temporal_unit!(
     date32_to_year,
     year,
@@ -72,7 +85,20 @@ to_temporal_unit!(
     Date32Type,
     UInt32Type
 );
-
+to_temporal_unit!(
+    date64_to_week,
+    week,
+    date64_as_datetime,
+    Date64Type,
+    UInt32Type
+);
+to_temporal_unit!(
+    date64_to_weekday,
+    p_weekday,
+    date64_as_datetime,
+    Date64Type,
+    UInt32Type
+);
 to_temporal_unit!(
     date64_to_year,
     year,

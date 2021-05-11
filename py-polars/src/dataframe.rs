@@ -1,6 +1,17 @@
-use polars::prelude::*;
+use std::convert::TryFrom;
+
+use pyo3::types::PyTuple;
 use pyo3::{exceptions::PyRuntimeError, prelude::*};
 
+use polars::frame::groupby::GroupBy;
+use polars::prelude::*;
+use polars_core::frame::groupby::resample::SampleRule;
+
+use crate::apply::dataframe::{
+    apply_lambda_unknown, apply_lambda_with_bool_out_type, apply_lambda_with_primitive_out_type,
+    apply_lambda_with_utf8_out_type,
+};
+use crate::conversion::Wrap;
 use crate::datatypes::PyDataType;
 use crate::file::FileLike;
 use crate::lazy::dataframe::PyLazyFrame;
@@ -11,8 +22,6 @@ use crate::{
     file::{get_either_file, get_file_like, EitherRustPythonFile},
     series::{to_pyseries_collection, to_series_collection, PySeries},
 };
-use polars::frame::{group_by::GroupBy, resample::SampleRule};
-use std::convert::TryFrom;
 
 #[pyclass]
 #[repr(transparent)]
@@ -52,7 +61,7 @@ impl PyDataFrame {
     pub fn read_csv(
         py_f: PyObject,
         infer_schema_length: usize,
-        batch_size: usize,
+        chunk_size: usize,
         has_header: bool,
         ignore_errors: bool,
         stop_after_n_rows: Option<usize>,
@@ -65,6 +74,7 @@ impl PyDataFrame {
         mut n_threads: Option<usize>,
         path: Option<String>,
         overwrite_dtype: Option<Vec<(&str, &PyAny)>>,
+        low_memory: bool
     ) -> PyResult<Self> {
         let encoding = match encoding {
             "utf8" => CsvEncoding::Utf8,
@@ -107,12 +117,13 @@ impl PyDataFrame {
             .with_ignore_parser_errors(ignore_errors)
             .with_projection(projection)
             .with_rechunk(rechunk)
-            .with_batch_size(batch_size)
+            .with_chunk_size(chunk_size)
             .with_encoding(encoding)
             .with_columns(columns)
             .with_n_threads(n_threads)
             .with_path(path)
-            .with_dtype_overwrite(overwrite_dtype.as_ref())
+            .with_dtypes(overwrite_dtype.as_ref())
+            .low_memory(low_memory)
             .finish()
             .map_err(PyPolarsEr::from)?;
         Ok(df.into())
@@ -174,6 +185,24 @@ impl PyDataFrame {
             .finish(&mut self.df)
             .map_err(PyPolarsEr::from)?;
         Ok(())
+    }
+
+    pub fn row_tuple(&self, idx: i64) -> PyObject {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let idx = if idx < 0 {
+            (self.df.height() as i64 + idx) as usize
+        } else {
+            idx as usize
+        };
+        PyTuple::new(
+            py,
+            self.df
+                .get_columns()
+                .iter()
+                .map(|s| Wrap(s.get(idx)).into_py(py)),
+        )
+        .into_py(py)
     }
 
     pub fn to_parquet(&mut self, path: &str) -> PyResult<()> {
@@ -296,6 +325,12 @@ impl PyDataFrame {
     pub fn set_column_names(&mut self, names: Vec<&str>) -> PyResult<()> {
         self.df.set_column_names(&names).map_err(PyPolarsEr::from)?;
         Ok(())
+    }
+
+    pub fn with_column(&mut self, s: PySeries) -> PyResult<Self> {
+        let mut df = self.df.clone();
+        df.with_column(s.series).map_err(PyPolarsEr::from)?;
+        Ok(df.into())
     }
 
     /// Get datatypes
@@ -443,9 +478,9 @@ impl PyDataFrame {
         Ok(())
     }
 
-    pub fn slice(&self, offset: usize, length: usize) -> PyResult<Self> {
-        let df = self.df.slice(offset, length).map_err(PyPolarsEr::from)?;
-        Ok(PyDataFrame::new(df))
+    pub fn slice(&self, offset: usize, length: usize) -> Self {
+        let df = self.df.slice(offset as i64, length);
+        df.into()
     }
 
     pub fn head(&self, length: Option<usize>) -> Self {
@@ -484,10 +519,12 @@ impl PyDataFrame {
         column_to_agg: Vec<(&str, Vec<&str>)>,
     ) -> PyResult<Self> {
         let rule = match rule {
-            "second" => SampleRule::Second(n),
-            "minute" => SampleRule::Minute(n),
+            "month" => SampleRule::Month(n),
+            "week" => SampleRule::Week(n),
             "day" => SampleRule::Day(n),
             "hour" => SampleRule::Hour(n),
+            "minute" => SampleRule::Minute(n),
+            "second" => SampleRule::Second(n),
             a => {
                 return Err(PyPolarsEr::Other(format!("rule {} not supported", a)).into());
             }
@@ -659,6 +696,7 @@ impl PyDataFrame {
     pub fn mean(&self) -> Self {
         self.df.mean().into()
     }
+
     pub fn std(&self) -> Self {
         self.df.std().into()
     }
@@ -669,6 +707,26 @@ impl PyDataFrame {
 
     pub fn median(&self) -> Self {
         self.df.median().into()
+    }
+
+    pub fn hmean(&self) -> PyResult<Option<PySeries>> {
+        let s = self.df.hmean().map_err(PyPolarsEr::from)?;
+        Ok(s.map(|s| s.into()))
+    }
+
+    pub fn hmax(&self) -> PyResult<Option<PySeries>> {
+        let s = self.df.hmax().map_err(PyPolarsEr::from)?;
+        Ok(s.map(|s| s.into()))
+    }
+
+    pub fn hmin(&self) -> PyResult<Option<PySeries>> {
+        let s = self.df.hmin().map_err(PyPolarsEr::from)?;
+        Ok(s.map(|s| s.into()))
+    }
+
+    pub fn hsum(&self) -> PyResult<Option<PySeries>> {
+        let s = self.df.hsum().map_err(PyPolarsEr::from)?;
+        Ok(s.map(|s| s.into()))
     }
 
     pub fn quantile(&self, quantile: f64) -> PyResult<Self> {
@@ -684,6 +742,64 @@ impl PyDataFrame {
     pub fn null_count(&self) -> Self {
         let df = self.df.null_count();
         df.into()
+    }
+
+    pub fn apply(&self, lambda: &PyAny, output_type: &PyAny) -> PyResult<PySeries> {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        let df = &self.df;
+
+        let output_type = match output_type.is_none() {
+            true => None,
+            false => {
+                let str_repr = output_type.str().unwrap().to_str().unwrap();
+                Some(str_to_polarstype(str_repr))
+            }
+        };
+        let out = match output_type {
+            Some(DataType::Int32) => {
+                apply_lambda_with_primitive_out_type::<Int32Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::Int64) => {
+                apply_lambda_with_primitive_out_type::<Int64Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::UInt32) => {
+                apply_lambda_with_primitive_out_type::<UInt32Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::UInt64) => {
+                apply_lambda_with_primitive_out_type::<UInt64Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::Float32) => {
+                apply_lambda_with_primitive_out_type::<Float32Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::Float64) => {
+                apply_lambda_with_primitive_out_type::<Float64Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::Boolean) => {
+                apply_lambda_with_bool_out_type(df, py, lambda, 0, None).into_series()
+            }
+            Some(DataType::Date32) => {
+                apply_lambda_with_primitive_out_type::<Date32Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::Date64) => {
+                apply_lambda_with_primitive_out_type::<Date64Type>(df, py, lambda, 0, None)
+                    .into_series()
+            }
+            Some(DataType::Utf8) => {
+                apply_lambda_with_utf8_out_type(df, py, lambda, 0, None).into_series()
+            }
+
+            _ => apply_lambda_unknown(df, py, lambda)?,
+        };
+
+        Ok(out.into())
     }
 }
 

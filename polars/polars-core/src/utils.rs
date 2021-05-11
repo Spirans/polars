@@ -10,6 +10,31 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
+pub struct Wrap<T>(pub T);
+
+impl<T> Deref for Wrap<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+unsafe fn index_of_unchecked<T>(slice: &[T], item: &T) -> usize {
+    (item as *const _ as usize - slice.as_ptr() as usize) / std::mem::size_of::<T>()
+}
+
+fn index_of<T>(slice: &[T], item: &T) -> Option<usize> {
+    debug_assert!(std::mem::size_of::<T>() > 0);
+    let ptr = item as *const T;
+    unsafe {
+        if slice.as_ptr() < ptr && slice.as_ptr().add(slice.len()) > ptr {
+            Some(index_of_unchecked(slice, item))
+        } else {
+            None
+        }
+    }
+}
+
 /// Used to split the mantissa and exponent of floating point numbers
 /// https://stackoverflow.com/questions/39638363/how-can-i-use-a-hashmap-with-f64-as-key-in-rust
 pub(crate) fn integer_decode_f64(val: f64) -> (u64, i16, i8) {
@@ -88,7 +113,7 @@ pub fn get_iter_capacity<T, I: Iterator<Item = T>>(iter: &I) -> usize {
 }
 
 macro_rules! split_array {
-    ($ca: expr, $n: expr) => {{
+    ($ca: expr, $n: expr, $ty : ty) => {{
         if $n == 1 {
             return Ok(vec![$ca.clone()]);
         }
@@ -103,19 +128,19 @@ macro_rules! split_array {
                 } else {
                     chunk_size
                 };
-                $ca.slice(i * chunk_size, len)
+                $ca.slice((i * chunk_size) as $ty, len)
             })
-            .collect::<Result<_>>()?;
+            .collect();
         Ok(v)
     }};
 }
 
 pub fn split_ca<T>(ca: &ChunkedArray<T>, n: usize) -> Result<Vec<ChunkedArray<T>>> {
-    split_array!(ca, n)
+    split_array!(ca, n, i64)
 }
 
 pub fn split_series(s: &Series, n: usize) -> Result<Vec<Series>> {
-    split_array!(s, n)
+    split_array!(s, n, i64)
 }
 
 pub fn split_df(df: &DataFrame, n: usize) -> Result<Vec<DataFrame>> {
@@ -127,10 +152,32 @@ pub fn split_df(df: &DataFrame, n: usize) -> Result<Vec<DataFrame>> {
             self.height()
         }
     }
-    split_array!(df, n)
+    split_array!(df, n, i64)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[inline]
+pub fn slice_offsets(offset: i64, length: usize, array_len: usize) -> (usize, usize) {
+    let abs_offset = offset.abs() as usize;
+
+    // The offset counted from the start of the array
+    // negative index
+    if offset < 0 {
+        if abs_offset <= array_len {
+            (array_len - abs_offset, std::cmp::min(length, abs_offset))
+            // negative index larger that array: slice from start
+        } else {
+            (0, std::cmp::min(length, array_len))
+        }
+        // positive index
+    } else if abs_offset <= array_len {
+        (abs_offset, std::cmp::min(length, array_len - abs_offset))
+        // empty slice
+    } else {
+        (array_len, 0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Node(pub usize);
 
 impl Default for Node {
@@ -159,6 +206,18 @@ impl<T> Arena<T> {
         Node(idx)
     }
 
+    pub fn pop(&mut self) -> Option<T> {
+        self.items.pop()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
     pub fn new() -> Self {
         Arena { items: vec![] }
     }
@@ -167,6 +226,10 @@ impl<T> Arena<T> {
         Arena {
             items: Vec::with_capacity(cap),
         }
+    }
+
+    pub fn get_node(&self, val: &T) -> Option<Node> {
+        index_of(&self.items, val).map(Node)
     }
 
     #[inline]
@@ -259,9 +322,12 @@ macro_rules! match_arrow_data_type_apply_macro {
         match $obj {
             DataType::Utf8 => $macro_utf8!($($opt_args)*),
             DataType::Boolean => $macro_bool!($($opt_args)*),
+            #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $macro!(UInt8Type $(, $opt_args)*),
+            #[cfg(feature = "dtype-u16")]
             DataType::UInt16 => $macro!(UInt16Type $(, $opt_args)*),
             DataType::UInt32 => $macro!(UInt32Type $(, $opt_args)*),
+            #[cfg(feature = "dtype-u64")]
             DataType::UInt64 => $macro!(UInt64Type $(, $opt_args)*),
             #[cfg(feature = "dtype-i8")]
             DataType::Int8 => $macro!(Int8Type $(, $opt_args)*),
@@ -287,14 +353,53 @@ macro_rules! match_arrow_data_type_apply_macro {
 }
 
 #[macro_export]
+macro_rules! match_arrow_data_type_apply_macro_ca {
+    ($self:expr, $macro:ident, $macro_utf8:ident, $macro_bool:ident $(, $opt_args:expr)*) => {{
+        match $self.dtype() {
+            DataType::Utf8 => $macro_utf8!($self.utf8().unwrap() $(, $opt_args)*),
+            DataType::Boolean => $macro_bool!($self.bool().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-u8")]
+            DataType::UInt8 => $macro!($self.u8().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-u16")]
+            DataType::UInt16 => $macro!($self.u16().unwrap() $(, $opt_args)*),
+            DataType::UInt32 => $macro!($self.u32().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-u64")]
+            DataType::UInt64 => $macro!($self.u64().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-i8")]
+            DataType::Int8 => $macro!($self.i8().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-i16")]
+            DataType::Int16 => $macro!($self.i16().unwrap() $(, $opt_args)*),
+            DataType::Int32 => $macro!($self.i32().unwrap() $(, $opt_args)*),
+            DataType::Int64 => $macro!($self.i64().unwrap() $(, $opt_args)*),
+            DataType::Float32 => $macro!($self.f32().unwrap() $(, $opt_args)*),
+            DataType::Float64 => $macro!($self.f64().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-date32")]
+            DataType::Date32 => $macro!($self.date32().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-date64")]
+            DataType::Date64 => $macro!($self.date64().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-time64-ns")]
+            DataType::Time64(TimeUnit::Nanosecond) => $macro!($self.time64_nanosecond().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-duration-ns")]
+            DataType::Duration(TimeUnit::Nanosecond) => $macro!($self.duration_nanosecond().unwrap() $(, $opt_args)*),
+            #[cfg(feature = "dtype-duration-ms")]
+            DataType::Duration(TimeUnit::Millisecond) => $macro!($self.duration_millisecond().unwrap() $(, $opt_args)*),
+            _ => unimplemented!(),
+        }
+    }};
+}
+
+#[macro_export]
 macro_rules! apply_method_all_arrow_series {
     ($self:expr, $method:ident, $($args:expr),*) => {
         match $self.dtype() {
             DataType::Boolean => $self.bool().unwrap().$method($($args),*),
             DataType::Utf8 => $self.utf8().unwrap().$method($($args),*),
+            #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $self.u8().unwrap().$method($($args),*),
+            #[cfg(feature = "dtype-u16")]
             DataType::UInt16 => $self.u16().unwrap().$method($($args),*),
             DataType::UInt32 => $self.u32().unwrap().$method($($args),*),
+            #[cfg(feature = "dtype-u64")]
             DataType::UInt64 => $self.u64().unwrap().$method($($args),*),
             #[cfg(feature = "dtype-i8")]
             DataType::Int8 => $self.i8().unwrap().$method($($args),*),
@@ -326,9 +431,12 @@ macro_rules! apply_method_numeric_series {
     ($self:ident, $method:ident, $($args:expr),*) => {
         match $self.dtype() {
 
+            #[cfg(feature = "dtype-u8")]
             DataType::UInt8 => $self.u8().unwrap().$method($($args),*),
+            #[cfg(feature = "dtype-u16")]
             DataType::UInt16 => $self.u16().unwrap().$method($($args),*),
             DataType::UInt32 => $self.u32().unwrap().$method($($args),*),
+            #[cfg(feature = "dtype-u64")]
             DataType::UInt64 => $self.u64().unwrap().$method($($args),*),
             #[cfg(feature = "dtype-i8")]
             DataType::Int8 => $self.i8().unwrap().$method($($args),*),
@@ -404,7 +512,6 @@ macro_rules! df {
             )+
             DataFrame::new(columns)
         }
-
     }
 }
 
@@ -561,11 +668,13 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
         (Date32, Int64) => Some(Int64),
         (Date32, Float32) => Some(Float32),
         (Date32, Float64) => Some(Float64),
+        (Date32, Date64) => Some(Date64),
 
         (Date64, Int32) => Some(Int64),
         (Date64, Int64) => Some(Int64),
         (Date64, Float32) => Some(Float64),
         (Date64, Float64) => Some(Float64),
+        (Date64, Date32) => Some(Date64),
 
         (Utf8, _) => Some(Utf8),
         (_, Utf8) => Some(Utf8),
@@ -581,6 +690,9 @@ fn _get_supertype(l: &DataType, r: &DataType) -> Option<DataType> {
         (Boolean, UInt64) => Some(UInt64),
         (Boolean, Float32) => Some(Float32),
         (Boolean, Float64) => Some(Float64),
+
+        (dt, Null) => Some(dt.clone()),
+        (Null, dt) => Some(dt.clone()),
 
         _ => None,
     }
@@ -634,7 +746,7 @@ where
     f(out)
 }
 
-pub(crate) trait CustomIterTools: Iterator {
+pub trait CustomIterTools: Iterator {
     fn fold_first_<F>(mut self, f: F) -> Option<Self::Item>
     where
         Self: Sized,
@@ -642,6 +754,13 @@ pub(crate) trait CustomIterTools: Iterator {
     {
         let first = self.next()?;
         Some(self.fold(first, f))
+    }
+
+    fn trust_my_length(self, length: usize) -> TrustMyLength<Self, Self::Item>
+    where
+        Self: Sized,
+    {
+        TrustMyLength::new(self, length)
     }
 }
 
@@ -747,5 +866,21 @@ where
                 Cow::Borrowed(c),
             )
         }
+    }
+}
+
+pub trait IntoVec<T> {
+    fn into_vec(self) -> Vec<T>;
+}
+
+impl IntoVec<bool> for bool {
+    fn into_vec(self) -> Vec<bool> {
+        vec![self]
+    }
+}
+
+impl<T> IntoVec<T> for Vec<T> {
+    fn into_vec(self) -> Self {
+        self
     }
 }

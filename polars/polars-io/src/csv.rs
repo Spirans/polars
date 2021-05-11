@@ -2,7 +2,7 @@
 //!
 //! ## Maximal performance
 //! Currently [CsvReader::new](CsvReader::new) has an extra copy. If you want optimal performance in CSV parsing/
-//! reading, it is adviced to use [CsvReader::from_path](CsvReader::from_path).
+//! reading, it is advised to use [CsvReader::from_path](CsvReader::from_path).
 //!
 //! ## Write a DataFrame to a csv file.
 //!
@@ -47,7 +47,6 @@
 //! let df = CsvReader::new(file)
 //! .infer_schema(Some(100))
 //! .has_header(true)
-//! .with_batch_size(100)
 //! .finish()
 //! .unwrap();
 //!
@@ -61,6 +60,7 @@ pub use arrow::csv::WriterBuilder;
 use polars_core::prelude::*;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Write a DataFrame to csv.
@@ -123,7 +123,7 @@ where
         self
     }
 
-    /// Set the CSV file's timestamp formatch array in
+    /// Set the CSV file's timestamp format array in
     pub fn with_timestamp_format(mut self, format: String) -> Self {
         self.writer_builder = self.writer_builder.with_timestamp_format(format);
         self
@@ -138,7 +138,9 @@ where
 
 #[derive(Copy, Clone)]
 pub enum CsvEncoding {
+    /// Utf8 encoding
     Utf8,
+    /// Utf8 encoding and unknown bytes are replaced with �
     LossyUtf8,
 }
 
@@ -175,23 +177,30 @@ where
     projection: Option<Vec<usize>>,
     /// Optional column names to project/ select.
     columns: Option<Vec<String>>,
-    batch_size: usize,
     delimiter: Option<u8>,
     has_header: bool,
     ignore_parser_errors: bool,
     schema: Option<Arc<Schema>>,
     encoding: CsvEncoding,
     n_threads: Option<usize>,
-    path: Option<String>,
+    path: Option<PathBuf>,
     schema_overwrite: Option<&'a Schema>,
     sample_size: usize,
-    stable_parser: bool,
+    chunk_size: usize,
+    low_memory: bool,
 }
 
 impl<'a, R> CsvReader<'a, R>
 where
     R: 'static + Read + Seek + Sync + Send,
 {
+    /// Sets the chunk size used by the parser. This influences performance
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.chunk_size = chunk_size;
+        self
+    }
+
+    /// Sets the CsvEncoding
     pub fn with_encoding(mut self, enc: CsvEncoding) -> Self {
         self.encoding = enc;
         self
@@ -210,7 +219,10 @@ where
         self
     }
 
-    /// Set the CSV file's schema
+    /// Set the CSV file's schema. This only accepts datatypes that are implemented
+    /// in the csv parser and expects a complete Schema.
+    ///
+    /// It is recommended to use [with_dtypes](Self::with_dtypes) instead.
     pub fn with_schema(mut self, schema: Arc<Schema>) -> Self {
         self.schema = Some(schema);
         self
@@ -242,7 +254,7 @@ where
 
     /// Overwrite the schema with the dtypes in this given Schema. The given schema may be a subset
     /// of the total schema.
-    pub fn with_dtype_overwrite(mut self, schema: Option<&'a Schema>) -> Self {
+    pub fn with_dtypes(mut self, schema: Option<&'a Schema>) -> Self {
         self.schema_overwrite = schema;
         self
     }
@@ -251,12 +263,6 @@ where
     pub fn infer_schema(mut self, max_records: Option<usize>) -> Self {
         // used by error ignore logic
         self.max_records = max_records;
-        self
-    }
-
-    /// Set the batch size (number of records to load at one time)
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = batch_size;
         self
     }
 
@@ -284,8 +290,8 @@ where
 
     /// The preferred way to initialize this builder. This allows the CSV file to be memory mapped
     /// and thereby greatly increases parsing performance.
-    pub fn with_path(mut self, path: Option<String>) -> Self {
-        self.path = path;
+    pub fn with_path<P: Into<PathBuf>>(mut self, path: Option<P>) -> Self {
+        self.path = path.map(|p| p.into());
         self
     }
 
@@ -297,9 +303,9 @@ where
         self
     }
 
-    /// Use the older/ likely more stable parser.
-    pub fn with_stable_parser(mut self, stable_parser: bool) -> Self {
-        self.stable_parser = stable_parser;
+    /// Reduce memory consumption at the expense of performance
+    pub fn low_memory(mut self, toggle: bool) -> Self {
+        self.low_memory = toggle;
         self
     }
 
@@ -309,7 +315,6 @@ where
             self.stop_after_n_rows,
             self.skip_rows,
             self.projection,
-            self.batch_size,
             self.max_records,
             self.delimiter,
             self.has_header,
@@ -321,16 +326,18 @@ where
             self.path,
             self.schema_overwrite,
             self.sample_size,
-            self.stable_parser,
+            self.chunk_size,
+            self.low_memory,
         )
     }
 }
 
 impl<'a> CsvReader<'a, File> {
     /// This is the recommended way to create a csv reader as this allows for fastest parsing.
-    pub fn from_path(path: &str) -> Result<Self> {
-        let f = std::fs::File::open(path)?;
-        Ok(Self::new(f).with_path(Some(path.to_string())))
+    pub fn from_path<P: Into<PathBuf>>(path: P) -> Result<Self> {
+        let path = path.into();
+        let f = std::fs::File::open(&path)?;
+        Ok(Self::new(f).with_path(Some(path)))
     }
 }
 
@@ -347,7 +354,6 @@ where
             max_records: Some(128),
             skip_rows: 0,
             projection: None,
-            batch_size: 32,
             delimiter: None,
             has_header: true,
             ignore_parser_errors: false,
@@ -358,26 +364,81 @@ where
             path: None,
             schema_overwrite: None,
             sample_size: 1024,
-            stable_parser: false,
+            chunk_size: 8192,
+            low_memory: false,
         }
     }
 
     /// Read the file and create the DataFrame.
     fn finish(self) -> Result<DataFrame> {
         let rechunk = self.rechunk;
-        let mut csv_reader = self.build_inner_reader()?;
-        let df = csv_reader.as_df(None, None)?;
 
-        match rechunk {
-            true => {
-                if df.n_chunks()? > 1 {
-                    Ok(df.agg_chunks())
-                } else {
-                    Ok(df)
-                }
+        let mut df = if let Some(schema) = self.schema_overwrite {
+            // This branch we check if there are dtypes we cannot parse.
+            // We only support a few dtypes in the parser and later cast to the required dtype
+            let mut to_cast = Vec::with_capacity(schema.len());
+
+            let fields = schema
+                .fields()
+                .iter()
+                .filter_map(|fld| {
+                    match fld.data_type() {
+                        // For categorical we first read as utf8 and later cast to categorical
+                        DataType::Categorical => {
+                            to_cast.push(fld);
+                            Some(Field::new(fld.name(), DataType::Utf8))
+                        }
+                        DataType::Date32 | DataType::Date64 => {
+                            to_cast.push(fld);
+                            // let inference decide the column type
+                            None
+                        }
+                        _ => Some(fld.clone()),
+                    }
+                })
+                .collect();
+            let schema = Schema::new(fields);
+
+            // we cannot overwrite self, because the lifetime is already instantiated with `a, and
+            // the lifetime that accompanies this scope is shorter.
+            // So we just build_csv_reader from here
+            let mut csv_reader = build_csv_reader(
+                self.reader,
+                self.stop_after_n_rows,
+                self.skip_rows,
+                self.projection,
+                self.max_records,
+                self.delimiter,
+                self.has_header,
+                self.ignore_parser_errors,
+                self.schema,
+                self.columns,
+                self.encoding,
+                self.n_threads,
+                self.path,
+                Some(&schema),
+                self.sample_size,
+                self.chunk_size,
+                self.low_memory,
+            )?;
+            let mut df = csv_reader.as_df(None, None)?;
+
+            // cast to the original dtypes in the schema
+            for fld in to_cast {
+                df.may_apply(fld.name(), |s| s.cast_with_dtype(fld.data_type()))?;
             }
-            false => Ok(df),
+            df
+        } else {
+            let mut csv_reader = self.build_inner_reader()?;
+            csv_reader.as_df(None, None)?
+        };
+
+        // Important that this rechunk is never done in parallel.
+        // As that leads to great memory overhead.
+        if rechunk && df.n_chunks()? > 1 {
+            df.as_single_chunk();
         }
+        Ok(df)
     }
 }
 
@@ -429,7 +490,6 @@ mod test {
             .infer_schema(Some(100))
             .has_header(true)
             .with_ignore_parser_errors(true)
-            .with_batch_size(100)
             .finish()
             .unwrap();
         dbg!(df.select_at_idx(0).unwrap().n_chunks());
@@ -446,7 +506,6 @@ mod test {
             // we also check if infer schema ignores errors
             .infer_schema(Some(10))
             .has_header(true)
-            .with_batch_size(2)
             .with_ignore_parser_errors(true)
             .finish()
             .unwrap();
@@ -464,7 +523,6 @@ mod test {
         let df = CsvReader::new(file)
             .infer_schema(Some(100))
             .has_header(true)
-            .with_batch_size(100)
             .finish()
             .unwrap();
 
@@ -484,7 +542,6 @@ mod test {
         let df = CsvReader::new(file)
             .infer_schema(Some(100))
             .has_header(true)
-            .with_batch_size(100)
             .finish()
             .unwrap();
 
@@ -509,7 +566,6 @@ mod test {
             .with_delimiter(b'\t')
             .has_header(false)
             .with_ignore_parser_errors(true)
-            .with_batch_size(100)
             .finish()
             .unwrap();
 
@@ -620,13 +676,13 @@ hello,","," ",world,"!""#;
     #[test]
     fn test_very_long_utf8() {
         let csv = r#"column_1,column_2,column_3
--86.64408227,"Lorem Ipsum is simply dummy text of the printing and typesetting 
+-86.64408227,"Lorem Ipsum is simply dummy text of the printing and typesetting
 industry. Lorem Ipsum has been the industry's standard dummy text ever since th
-e 1500s, when an unknown printer took a galley of type and scrambled it to make 
-a type specimen book. It has survived not only five centuries, but also the leap 
-into electronic typesetting, remaining essentially unchanged. It was popularised 
-in the 1960s with the release of Letraset sheets containing Lorem Ipsum passages, 
-and more recently with desktop publishing software like Aldus PageMaker including 
+e 1500s, when an unknown printer took a galley of type and scrambled it to make
+a type specimen book. It has survived not only five centuries, but also the leap
+into electronic typesetting, remaining essentially unchanged. It was popularised
+in the 1960s with the release of Letraset sheets containing Lorem Ipsum passages,
+and more recently with desktop publishing software like Aldus PageMaker including
 versions of Lorem Ipsum.",11"#;
         let file = Cursor::new(csv);
         let df = CsvReader::new(file).finish().unwrap();
@@ -634,13 +690,13 @@ versions of Lorem Ipsum.",11"#;
         assert!(df.column("column_2").unwrap().series_equal(&Series::new(
             "column_2",
             &[
-                r#"Lorem Ipsum is simply dummy text of the printing and typesetting 
+                r#"Lorem Ipsum is simply dummy text of the printing and typesetting
 industry. Lorem Ipsum has been the industry's standard dummy text ever since th
-e 1500s, when an unknown printer took a galley of type and scrambled it to make 
-a type specimen book. It has survived not only five centuries, but also the leap 
-into electronic typesetting, remaining essentially unchanged. It was popularised 
-in the 1960s with the release of Letraset sheets containing Lorem Ipsum passages, 
-and more recently with desktop publishing software like Aldus PageMaker including 
+e 1500s, when an unknown printer took a galley of type and scrambled it to make
+a type specimen book. It has survived not only five centuries, but also the leap
+into electronic typesetting, remaining essentially unchanged. It was popularised
+in the 1960s with the release of Letraset sheets containing Lorem Ipsum passages,
+and more recently with desktop publishing software like Aldus PageMaker including
 versions of Lorem Ipsum."#,
             ]
         )));
@@ -676,6 +732,19 @@ id090,id048,id0000067778,24,2,51862,4,9,"#;
     }
 
     #[test]
+    fn test_quoted_numeric() {
+        // CSV fields may be quoted
+        let s = r#""foo","bar"
+"4.9","3"
+"1.4","2""#;
+
+        let file = Cursor::new(s);
+        let df = CsvReader::new(file).has_header(true).finish().unwrap();
+        assert_eq!(df.column("bar").unwrap().dtype(), &DataType::Int64);
+        assert_eq!(df.column("foo").unwrap().dtype(), &DataType::Float64);
+    }
+
+    #[test]
     fn test_empty_bytes_to_dataframe() {
         let fields = vec![Field::new("test_field", DataType::Utf8)];
         let schema = Schema::new(fields);
@@ -693,5 +762,61 @@ id090,id048,id0000067778,24,2,51862,4,9,"#;
             .with_schema(Arc::new(schema))
             .finish();
         assert!(result.is_ok())
+    }
+
+    #[test]
+    fn test_carriage_return() {
+        let csv =
+            "\"foo\",\"bar\"\r\n\"158252579.00\",\"7.5800\"\r\n\"158252579.00\",\"7.5800\"\r\n";
+
+        let file = Cursor::new(csv);
+        let df = CsvReader::new(file).has_header(true).finish().unwrap();
+        assert_eq!(df.shape(), (2, 2));
+    }
+
+    #[test]
+    fn test_missing_value() {
+        let csv = r#"foo,bar,ham
+1,2,3
+1,2,3
+1,2"#;
+
+        let file = Cursor::new(csv);
+        let df = CsvReader::new(file)
+            .has_header(true)
+            .with_schema(Arc::new(Schema::new(vec![
+                Field::new("foo", DataType::UInt32),
+                Field::new("bar", DataType::UInt32),
+                Field::new("ham", DataType::UInt32),
+            ])))
+            .finish()
+            .unwrap();
+        assert_eq!(df.column("ham").unwrap().len(), 3)
+    }
+
+    #[test]
+    fn test_with_dtype() -> Result<()> {
+        // test if timestamps can be parsed as Date64
+        let csv = r#"a,b,c,d,e
+AUDCAD,1616455919,0.91212,0.95556,1
+AUDCAD,1616455920,0.92212,0.95556,1
+AUDCAD,1616455921,0.96212,0.95666,1"#;
+        let file = Cursor::new(csv);
+        let df = CsvReader::new(file)
+            .has_header(true)
+            .with_dtypes(Some(&Schema::new(vec![Field::new("b", DataType::Date64)])))
+            .finish()?;
+
+        assert_eq!(
+            df.dtypes(),
+            &[
+                DataType::Utf8,
+                DataType::Date64,
+                DataType::Float64,
+                DataType::Float64,
+                DataType::Int64
+            ]
+        );
+        Ok(())
     }
 }

@@ -1,6 +1,6 @@
 //! Implementations of the ChunkApply Trait.
 use crate::prelude::*;
-use crate::utils::NoNull;
+use crate::utils::{CustomIterTools, NoNull};
 use arrow::array::{Array, ArrayRef, BooleanArray, LargeStringArray, PrimitiveArray};
 use std::borrow::Cow;
 use std::convert::TryFrom;
@@ -40,7 +40,6 @@ where
     {
         let mut ca: ChunkedArray<S> = self
             .data_views()
-            .into_iter()
             .zip(self.null_bits())
             .map(|(slice, (_null_count, opt_buffer))| {
                 let vec: AlignedVec<_> = slice.iter().copied().map(f).collect();
@@ -57,8 +56,7 @@ where
         S: PolarsNumericType,
     {
         let chunks = self
-            .downcast_chunks()
-            .into_iter()
+            .downcast_iter()
             .map(|array| {
                 let av: AlignedVec<_> = if array.null_count() == 0 {
                     array.values().iter().map(|&v| f(Some(v))).collect()
@@ -75,22 +73,17 @@ where
     where
         F: Fn(T::Native) -> T::Native + Copy,
     {
-        if let Ok(slice) = self.cont_slice() {
-            let new: NoNull<ChunkedArray<T>> = slice.iter().copied().map(f).collect();
-            new.into_inner()
-        } else {
-            let mut ca: ChunkedArray<T> = self
-                .data_views()
-                .into_iter()
-                .zip(self.null_bits())
-                .map(|(slice, (_null_count, opt_buffer))| {
-                    let vec: AlignedVec<_> = slice.iter().copied().map(f).collect();
-                    (vec, opt_buffer)
-                })
-                .collect();
-            ca.rename(self.name());
-            ca
-        }
+        let mut ca: ChunkedArray<T> = self
+            .data_views()
+            .into_iter()
+            .zip(self.null_bits())
+            .map(|(slice, (_null_count, opt_buffer))| {
+                let vec: AlignedVec<_> = slice.iter().copied().map(f).collect();
+                (vec, opt_buffer)
+            })
+            .collect();
+        ca.rename(self.name());
+        ca
     }
 
     fn apply_with_idx<F>(&'a self, f: F) -> Self
@@ -101,7 +94,9 @@ where
             let ca: NoNull<_> = self.into_no_null_iter().enumerate().map(f).collect();
             ca.into_inner()
         } else {
-            self.into_iter()
+            self.downcast_iter()
+                .flatten()
+                .trust_my_length(self.len())
                 .enumerate()
                 .map(|(idx, opt_v)| opt_v.map(|v| f((idx, v))))
                 .collect()
@@ -112,7 +107,12 @@ where
     where
         F: Fn((usize, Option<T::Native>)) -> Option<T::Native> + Copy,
     {
-        self.into_iter().enumerate().map(f).collect()
+        self.downcast_iter()
+            .flatten()
+            .trust_my_length(self.len())
+            .enumerate()
+            .map(f)
+            .collect()
     }
 }
 
@@ -170,7 +170,7 @@ impl<'a> ChunkApply<'a, &'a str, Cow<'a, str>> for Utf8Chunked {
         S: PolarsNumericType,
     {
         let chunks = self
-            .downcast_chunks()
+            .downcast_iter()
             .into_iter()
             .map(|array| {
                 let av: AlignedVec<_> = (0..array.len())
@@ -189,7 +189,7 @@ impl<'a> ChunkApply<'a, &'a str, Cow<'a, str>> for Utf8Chunked {
         S: PolarsNumericType,
     {
         let chunks = self
-            .downcast_chunks()
+            .downcast_iter()
             .into_iter()
             .map(|array| {
                 let av: AlignedVec<_> = array.into_iter().map(f).collect();
@@ -227,7 +227,7 @@ impl ChunkApplyKernel<BooleanArray> for BooleanChunked {
         F: Fn(&BooleanArray) -> ArrayRef,
     {
         let chunks = self
-            .downcast_chunks()
+            .downcast_iter()
             .into_iter()
             .map(|array| f(array))
             .collect();
@@ -240,7 +240,7 @@ impl ChunkApplyKernel<BooleanArray> for BooleanChunked {
         S: PolarsDataType,
     {
         let chunks = self
-            .downcast_chunks()
+            .downcast_iter()
             .into_iter()
             .map(|array| f(array))
             .collect();
@@ -250,7 +250,7 @@ impl ChunkApplyKernel<BooleanArray> for BooleanChunked {
 
 impl<T> ChunkApplyKernel<PrimitiveArray<T>> for ChunkedArray<T>
 where
-    T: PolarsPrimitiveType,
+    T: PolarsNumericType,
 {
     fn apply_kernel<F>(&self, f: F) -> Self
     where
@@ -263,7 +263,7 @@ where
         F: Fn(&PrimitiveArray<T>) -> ArrayRef,
         S: PolarsDataType,
     {
-        let chunks = self.downcast_chunks().into_iter().map(f).collect();
+        let chunks = self.downcast_iter().into_iter().map(f).collect();
         ChunkedArray::new_from_chunks(self.name(), chunks)
     }
 }
@@ -281,7 +281,7 @@ impl ChunkApplyKernel<LargeStringArray> for Utf8Chunked {
         F: Fn(&LargeStringArray) -> ArrayRef,
         S: PolarsDataType,
     {
-        let chunks = self.downcast_chunks().into_iter().map(f).collect();
+        let chunks = self.downcast_iter().into_iter().map(f).collect();
         ChunkedArray::new_from_chunks(self.name(), chunks)
     }
 }
@@ -293,7 +293,7 @@ impl<'a> ChunkApply<'a, Series, Series> for ListChunked {
         S: PolarsNumericType,
     {
         let chunks = self
-            .downcast_chunks()
+            .downcast_iter()
             .into_iter()
             .map(|array| {
                 let av: AlignedVec<_> = (0..array.len())
@@ -316,7 +316,7 @@ impl<'a> ChunkApply<'a, Series, Series> for ListChunked {
         S: PolarsNumericType,
     {
         let chunks = self
-            .downcast_chunks()
+            .downcast_iter()
             .into_iter()
             .map(|array| {
                 let av: AlignedVec<_> = (0..array.len())

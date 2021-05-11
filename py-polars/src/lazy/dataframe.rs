@@ -139,12 +139,14 @@ impl PyLazyFrame {
         predicate_pushdown: bool,
         projection_pushdown: bool,
         simplify_expr: bool,
+        string_cache: bool,
     ) -> PyLazyFrame {
         let ldf = self.ldf.clone();
         let ldf = ldf
             .with_type_coercion(type_coercion)
             .with_predicate_pushdown(predicate_pushdown)
             .with_simplify_expr(simplify_expr)
+            .with_string_cache(string_cache)
             .with_projection_pushdown(projection_pushdown);
         ldf.into()
     }
@@ -152,6 +154,12 @@ impl PyLazyFrame {
     pub fn sort(&self, by_column: &str, reverse: bool) -> PyLazyFrame {
         let ldf = self.ldf.clone();
         ldf.sort(by_column, reverse).into()
+    }
+
+    pub fn sort_by_exprs(&self, by_column: Vec<PyExpr>, reverse: Vec<bool>) -> PyLazyFrame {
+        let ldf = self.ldf.clone();
+        let exprs = py_exprs_to_exprs(by_column);
+        ldf.sort_by_exprs(exprs, reverse).into()
     }
     pub fn cache(&self) -> PyLazyFrame {
         let ldf = self.ldf.clone();
@@ -316,9 +324,14 @@ impl PyLazyFrame {
             .into()
     }
 
-    pub fn slice(&self, offset: usize, len: usize) -> Self {
+    pub fn slice(&self, offset: i64, len: usize) -> Self {
         let ldf = self.ldf.clone();
         ldf.slice(offset, len).into()
+    }
+
+    pub fn tail(&self, n: usize) -> Self {
+        let ldf = self.ldf.clone();
+        ldf.tail(n).into()
     }
 
     pub fn melt(&self, id_vars: Vec<String>, value_vars: Vec<String>) -> Self {

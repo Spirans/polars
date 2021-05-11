@@ -1,6 +1,7 @@
-use crate::logical_plan::*;
-use crate::prelude::*;
 use polars_core::utils::Arena;
+
+use crate::logical_plan::optimizer::stack_opt::OptimizationRule;
+use crate::logical_plan::*;
 
 macro_rules! eval_binary_same_type {
     ($lhs:expr, $operand: tt, $rhs:expr) => {{
@@ -26,15 +27,18 @@ macro_rules! eval_binary_same_type {
             (LiteralValue::Int64(x), LiteralValue::Int64(y)) => {
                 Some(AExpr::Literal(LiteralValue::Int64(x $operand y)))
             }
+            #[cfg(feature = "dtype-u8")]
             (LiteralValue::UInt8(x), LiteralValue::UInt8(y)) => {
                 Some(AExpr::Literal(LiteralValue::UInt8(x $operand y)))
             }
+            #[cfg(feature = "dtype-u16")]
             (LiteralValue::UInt16(x), LiteralValue::UInt16(y)) => {
                 Some(AExpr::Literal(LiteralValue::UInt16(x $operand y)))
             }
             (LiteralValue::UInt32(x), LiteralValue::UInt32(y)) => {
                 Some(AExpr::Literal(LiteralValue::UInt32(x $operand y)))
             }
+            #[cfg(feature = "dtype-u64")]
             (LiteralValue::UInt64(x), LiteralValue::UInt64(y)) => {
                 Some(AExpr::Literal(LiteralValue::UInt64(x $operand y)))
             }
@@ -70,15 +74,18 @@ macro_rules! eval_binary_bool_type {
             (LiteralValue::Int64(x), LiteralValue::Int64(y)) => {
                 Some(AExpr::Literal(LiteralValue::Boolean(x $operand y)))
             }
+            #[cfg(feature = "dtype-u8")]
             (LiteralValue::UInt8(x), LiteralValue::UInt8(y)) => {
                 Some(AExpr::Literal(LiteralValue::Boolean(x $operand y)))
             }
+            #[cfg(feature = "dtype-u16")]
             (LiteralValue::UInt16(x), LiteralValue::UInt16(y)) => {
                 Some(AExpr::Literal(LiteralValue::Boolean(x $operand y)))
             }
             (LiteralValue::UInt32(x), LiteralValue::UInt32(y)) => {
                 Some(AExpr::Literal(LiteralValue::Boolean(x $operand y)))
             }
+            #[cfg(feature = "dtype-u64")]
             (LiteralValue::UInt64(x), LiteralValue::UInt64(y)) => {
                 Some(AExpr::Literal(LiteralValue::Boolean(x $operand y)))
             }
@@ -299,15 +306,32 @@ impl OptimizationRule for SimplifyExprRule {
                     Operator::LtEq => eval_binary_bool_type!(left, >=, right),
                     Operator::And => eval_and(left, right),
                     Operator::Or => eval_or(left, right),
+                }
+            }
+            AExpr::Reverse(expr) => {
+                let input = expr_arena.get(*expr);
+                match input {
+                    AExpr::Sort { expr, reverse } => Some(AExpr::Sort {
+                        expr: *expr,
+                        reverse: !*reverse,
+                    }),
+                    AExpr::SortBy { expr, by, reverse } => Some(AExpr::SortBy {
+                        expr: *expr,
+                        by: *by,
+                        reverse: !*reverse,
+                    }),
+                    // TODO: add support for cum_sum and other operation that allow reversing.
                     _ => None,
                 }
             }
+
             _ => None,
         }
     }
 }
 
 #[test]
+#[cfg(feature = "dtype-i8")]
 fn test_expr_to_aexp() {
     use super::*;
 

@@ -1,6 +1,6 @@
 [package]
 name = "polars-lazy"
-version = "0.12.0"
+version = "0.13.3"
 authors = ["ritchie46 <ritchie46@gmail.com>"]
 edition = "2018"
 license = "MIT"
@@ -15,19 +15,28 @@ temporal = ["polars-core/temporal"]
 # debugging purposesses
 fmt = ["polars-core/plain_fmt"]
 future = []
+dtype-u8 = ["polars-core/dtype-u8"]
+dtype-u16 = ["polars-core/dtype-u16"]
+dtype-u64 = ["polars-core/dtype-u64", "polars-io/dtype-u64"]
 dtype-i8 = ["polars-core/dtype-i8"]
 dtype-i16 = ["polars-core/dtype-i16"]
 dtype-date32 = ["polars-core/dtype-date32"]
 dtype-date64 = ["polars-core/dtype-date64"]
+ooc = ["datafusion", "tokio"]
+
+# is_in operation
+is_in = ["polars-core/is_in"]
 
 [dependencies]
 ahash = "0.7"
 rayon = "1.5"
 itertools = "0.10"
 
-polars-io = {version = "0.12.0", path = "../polars-io", features = ["lazy"], default-features=false}
-polars-core = {version = "0.12.0", path = "../polars-core", features = ["lazy"], default-features=false}
-polars-arrow = {version = "0.12.0", path = "../polars-arrow"}
+polars-io = {version = "0.13.3", path = "../polars-io", features = ["lazy", "csv-file"], default-features=false}
+polars-core = {version = "0.13.3", path = "../polars-core", features = ["lazy"], default-features=false}
+polars-arrow = {version = "0.13.3", path = "../polars-arrow"}
+datafusion = {version="4.0.0-SNAPSHOT", git = "https://github.com/apache/arrow-datafusion", rev = "88222b7", default-features=false, optional=true}
+tokio = { version = "1.0", features = ["macros", "rt", "rt-multi-thread", "sync"] , optional=true}
 
 [package.metadata.docs.rs]
 all-features = true

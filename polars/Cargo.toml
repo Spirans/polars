@@ -1,44 +1,68 @@
 [package]
 name = "polars"
-version = "0.12.0"
+version = "0.13.3"
 authors = ["ritchie46 <ritchie46@gmail.com>"]
 edition = "2018"
 license = "MIT"
-description = "DataFrame library"
+description = "DataFrame Library based on Apache Arrow"
 repository = "https://github.com/ritchie46/polars"
 readme = "../README.md"
 
 [features]
 simd = ["polars-core/simd"]
+avx512 = ["polars-core/avx512"]
 docs = ["polars-core/docs"]
 temporal = ["polars-core/temporal", "polars-lazy/temporal"]
 random = ["polars-core/random"]
 default = ["docs",
+    "csv-file",
     "temporal",
     "performant",
     "plain_fmt",
-    "mimalloc"
+    "dtype-slim",
 ]
 ndarray = ["polars-core/ndarray"]
-parquet = ["polars-core/parquet", "polars-lazy/parquet", "polars-io/parquet"]
-lazy = ["polars-core/lazy"]
+parquet = ["polars-io", "polars-core/parquet", "polars-lazy/parquet", "polars-io/parquet"]
+lazy = ["polars-core/lazy", "polars-lazy"]
 # commented out until UB is fixed
 #parallel = ["polars-core/parallel"]
+
 # extra utilities for Utf8Chunked
 strings = ["polars-core/strings"]
+
 # support for ObjectChunked<T> (downcastable Series of any type)
 object = ["polars-core/object"]
+
 # support for arrows json parsing
-json = ["polars-io/json"]
+json = ["polars-io", "polars-io/json"]
+
 # support for arrows ipc file parsing
-ipc = ["polars-io/ipc"]
-# ~40% faster chunkedarray creation, but may lead to unexpected panic if iterator incorrectly sets a size_hint
+ipc = ["polars-io", "polars-io/ipc"]
+
+# support for arrows csv file parsing
+csv-file = ["polars-io", "polars-io/csv-file"]
+
+# ~40% faster chunkedarray creation, but may larrowead to unexpected panic if iterator incorrectly sets a size_hint
 # that fits a TrustedLen iterator.
 performant = ["polars-core/performant"]
+
+# Choose one of those features for dataframe formatting.
+#   - plain_fmt: less compile times, simpler formatting
+#   - pretty_fmt: better looking dataframes for increase compile times
 plain_fmt = ["polars-core/plain_fmt"]
 pretty_fmt = ["polars-core/pretty_fmt"]
 
-# opt-in datatypes
+# features
+# resample operation on DataFrame
+pivot = ["polars-core/pivot"]
+# resample operation on DataFrame
+downsample = ["polars-core/downsample"]
+# sort by multiple columns
+sort_multiple = ["polars-core/sort_multiple"]
+# is_in operation
+is_in = ["polars-core/is_in", "polars-lazy/is_in"]
+
+# all opt-in datatypes
 dtype-full = [
     "dtype-time64-ns",
     "dtype-duration-ns",
@@ -47,8 +71,18 @@ dtype-full = [
     "dtype-date64",
     "dtype-i8",
     "dtype-i16",
+    "dtype-u8",
+    "dtype-u16",
+    "dtype-u64",
 ]
 
+# sensible minimal set of opt-in datatypes
+dtype-slim = [
+    "dtype-date32",
+    "dtype-date64",
+]
+
+# opt-in datatypes for Series
 dtype-time64-ns = ["polars-core/dtype-time64-ns"]
 dtype-duration-ns = ["polars-core/dtype-duration-ns"]
 dtype-duration-ms = ["polars-core/dtype-duration-ms"]
@@ -56,18 +90,20 @@ dtype-date32 = ["polars-core/dtype-date32", "polars-lazy/dtype-date32"]
 dtype-date64 = ["polars-core/dtype-date64", "polars-lazy/dtype-date64"]
 dtype-i8 = ["polars-core/dtype-i8", "polars-lazy/dtype-i8"]
 dtype-i16 = ["polars-core/dtype-i16", "polars-lazy/dtype-i16"]
+dtype-u8 = ["polars-core/dtype-u8", "polars-lazy/dtype-u8"]
+dtype-u16 = ["polars-core/dtype-u16", "polars-lazy/dtype-u16"]
+dtype-u64 = ["polars-core/dtype-u64", "polars-lazy/dtype-u64", "polars-io/dtype-u64"]
 
 [dependencies]
-polars-core = {version = "0.12.0", path = "./polars-core", features= ["docs"], default-features = false}
-polars-io = {version = "0.12.0", path = "./polars-io", default-features = false}
-polars-lazy = {version = "0.12.0", path = "./polars-lazy", default-features = false}
-mimalloc = { version = "*", default-features = false, optional = true}
+polars-core = {version = "0.13.3", path = "./polars-core", features= ["docs"], default-features = false}
+polars-io = {version = "0.13.3", path = "./polars-io", default-features = false, optional=true}
+polars-lazy = {version = "0.13.3", path = "./polars-lazy", default-features = false, optional=true}
 
 [dev-dependencies]
 criterion = "0.3"
 lazy_static = "1.4"
 rand = "0.8"
-ahash = "0.7.0"
+ahash = "0.7"
 
 # see: https://bheisler.github.io/criterion.rs/book/faq.html
 [lib]

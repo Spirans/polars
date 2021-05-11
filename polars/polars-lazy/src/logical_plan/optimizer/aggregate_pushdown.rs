@@ -1,24 +1,25 @@
+use polars_core::prelude::*;
+
+use crate::logical_plan::optimizer::stack_opt::OptimizationRule;
 use crate::logical_plan::Context;
 use crate::prelude::*;
 use crate::utils::{aexpr_to_root_nodes, has_aexpr};
-use polars_core::prelude::*;
 
 pub(crate) struct AggregatePushdown {
-    state: Vec<Node>,
+    accumulated_projections: Vec<Node>,
     processed_state: bool,
 }
 
 impl AggregatePushdown {
     pub(crate) fn new() -> Self {
         AggregatePushdown {
-            state: vec![],
+            accumulated_projections: vec![],
             processed_state: false,
         }
     }
-    fn drain_nodes(&mut self) -> impl Iterator<Item = Node> {
+    fn process_nodes(&mut self) -> Vec<Node> {
         self.processed_state = true;
-        let state = std::mem::take(&mut self.state);
-        state.into_iter()
+        std::mem::take(&mut self.accumulated_projections)
     }
 
     fn pushdown_projection(
@@ -30,30 +31,18 @@ impl AggregatePushdown {
         lp_arena: &mut Arena<ALogicalPlan>,
         expr_arena: &mut Arena<AExpr>,
     ) -> Option<ALogicalPlan> {
-        let dummy_node = usize::max_value();
-        let dummy_min = AExpr::Agg(AAggExpr::Min(Node(dummy_node)));
-        let dummy_max = AExpr::Agg(AAggExpr::Max(Node(dummy_node)));
-        let dummy_first = AExpr::Agg(AAggExpr::First(Node(dummy_node)));
-        let dummy_last = AExpr::Agg(AAggExpr::First(Node(dummy_node)));
-        let dummy_sum = AExpr::Agg(AAggExpr::Sum(Node(dummy_node)));
-
         // only do aggregation pushdown if all projections are aggregations
         #[allow(clippy::blocks_in_if_conditions)]
         if !self.processed_state
             && expr.iter().all(|node| {
-                (has_aexpr(*node, expr_arena, &dummy_min)
-                    || has_aexpr(*node, expr_arena, &dummy_max)
-                    || has_aexpr(*node, expr_arena, &dummy_first)
-                    || has_aexpr(*node, expr_arena, &dummy_sum)
-                    || has_aexpr(*node, expr_arena, &dummy_last))
-                    && {
-                        let roots = aexpr_to_root_nodes(*node, expr_arena);
-                        roots.len() == 1
-                    }
+                has_aexpr(*node, expr_arena, |e| matches!(e, AExpr::Agg(_))) && {
+                    let roots = aexpr_to_root_nodes(*node, expr_arena);
+                    roots.len() == 1
+                }
             })
         {
             // add to state
-            self.state.extend_from_slice(&expr);
+            self.accumulated_projections.extend_from_slice(&expr);
             // swap projection with the input node
             let lp = lp_arena.take(input);
             Some(lp)
@@ -96,7 +85,7 @@ impl OptimizationRule for AggregatePushdown {
             } => self.pushdown_projection(node, expr, input, schema, lp_arena, expr_arena),
             // todo! hstack should pushown not dependent columns
             Join { .. } | Aggregate { .. } | HStack { .. } | DataFrameScan { .. } => {
-                if self.state.is_empty() {
+                if self.accumulated_projections.is_empty() {
                     lp_arena.replace(node, lp);
                     None
                 } else {
@@ -104,13 +93,14 @@ impl OptimizationRule for AggregatePushdown {
                     let new_node = lp_arena.add(lp.clone());
                     let input_schema = lp_arena.get(new_node).schema(lp_arena);
 
-                    let nodes: Vec<_> = self.drain_nodes().collect();
-                    let fields = nodes
+                    let nodes: Vec<_> = self.process_nodes();
+                    let fields = self
+                        .accumulated_projections
                         .iter()
                         .map(|n| {
                             expr_arena
                                 .get(*n)
-                                .to_field(input_schema, Context::Other, expr_arena)
+                                .to_field(input_schema, Context::Default, expr_arena)
                                 .unwrap()
                         })
                         .collect();
@@ -134,7 +124,8 @@ impl OptimizationRule for AggregatePushdown {
                 predicate,
                 aggregate,
                 cache,
-            } => match self.state.is_empty() {
+                low_memory,
+            } => match self.accumulated_projections.is_empty() {
                 true => {
                     lp_arena.replace(
                         node,
@@ -150,12 +141,13 @@ impl OptimizationRule for AggregatePushdown {
                             predicate,
                             aggregate,
                             cache,
+                            low_memory,
                         },
                     );
                     None
                 }
                 false => {
-                    let aggregate: Vec<_> = self.drain_nodes().collect();
+                    let aggregate: Vec<_> = self.process_nodes();
                     Some(ALogicalPlan::CsvScan {
                         path,
                         schema,
@@ -168,6 +160,7 @@ impl OptimizationRule for AggregatePushdown {
                         predicate,
                         aggregate,
                         cache,
+                        low_memory,
                     })
                 }
             },
@@ -180,7 +173,7 @@ impl OptimizationRule for AggregatePushdown {
                 aggregate,
                 stop_after_n_rows,
                 cache,
-            } => match self.state.is_empty() {
+            } => match self.accumulated_projections.is_empty() {
                 true => {
                     lp_arena.replace(
                         node,
@@ -197,7 +190,7 @@ impl OptimizationRule for AggregatePushdown {
                     None
                 }
                 false => {
-                    let aggregate = self.drain_nodes().collect();
+                    let aggregate = self.process_nodes();
                     Some(ALogicalPlan::ParquetScan {
                         path,
                         schema,

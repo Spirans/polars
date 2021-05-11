@@ -359,6 +359,11 @@ fn prepare_row(row: Vec<AnyValue>, n_first: usize, n_last: usize) -> Vec<String>
 
 impl Display for DataFrame {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let height = self.height();
+        if !self.columns.iter().all(|s| s.len() == height) {
+            panic!("The columns lengths in the DataFrame are not equal.");
+        }
+
         let max_n_cols = std::env::var("POLARS_FMT_MAX_COLS")
             .unwrap_or_else(|_| "8".to_string())
             .parse()
@@ -433,6 +438,15 @@ impl Display for DataFrame {
 
             write!(f, "shape: {:?}\n{}", self.shape(), table)?;
         }
+        #[cfg(not(any(feature = "plain_fmt", feature = "pretty_fmt")))]
+        {
+            write!(
+                f,
+                "shape: {:?}\nto see more, compile with 'plain_fmt' or 'pretty_fmt' feature",
+                self.shape()
+            )?;
+        }
+
         #[cfg(all(feature = "plain_fmt", not(feature = "pretty_fmt")))]
         {
             let mut table = Table::new();
@@ -531,7 +545,7 @@ impl Display for AnyValue<'_> {
 macro_rules! fmt_option {
     ($opt:expr) => {{
         match $opt {
-            Some(v) => format!("{:?}", v),
+            Some(v) => format!("{}", v),
             None => "null".to_string(),
         }
     }};
@@ -570,6 +584,7 @@ pub(crate) trait FmtList {
 impl<T> FmtList for ChunkedArray<T>
 where
     T: PolarsPrimitiveType,
+    T::Native: fmt::Display,
 {
     fn fmt_list(&self) -> String {
         impl_fmt_list!(self)
@@ -607,7 +622,12 @@ impl<T> FmtList for ObjectChunked<T> {
     }
 }
 
-#[cfg(all(test, feature = "temporal"))]
+#[cfg(all(
+    test,
+    feature = "temporal",
+    feature = "dtype-date32",
+    feature = "dtype-date64"
+))]
 mod test {
     use crate::prelude::*;
     use polars_arrow::prelude::PrimitiveArrayBuilder;
@@ -632,6 +652,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "dtype-time64-ns")]
     fn temporal() {
         let s = Date32Chunked::new_from_opt_slice("date32", &[Some(1), None, Some(3)]);
         assert_eq!(

@@ -1,9 +1,9 @@
 #[cfg(feature = "object")]
 use crate::chunked_array::object::ObjectType;
-use crate::frame::group_by::GroupTuples;
+use crate::frame::groupby::GroupTuples;
 use crate::prelude::*;
 use crate::utils::{floating_encode_f64, integer_decode_f64, NoNull};
-use crate::{chunked_array::float::IntegerDecode, frame::group_by::IntoGroupTuples};
+use crate::{chunked_array::float::IntegerDecode, frame::groupby::IntoGroupTuples};
 use ahash::RandomState;
 use itertools::Itertools;
 use num::{NumCast, ToPrimitive};
@@ -72,7 +72,7 @@ impl ChunkUnique<ListType> for ListChunked {
         ))
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
         Err(PolarsError::InvalidOperation(
             "unique not supported for list".into(),
         ))
@@ -86,7 +86,7 @@ impl<T> ChunkUnique<ObjectType<T>> for ObjectChunked<T> {
         ))
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
         Err(PolarsError::InvalidOperation(
             "unique not supported for object".into(),
         ))
@@ -106,12 +106,12 @@ where
     set
 }
 
-fn arg_unique<T>(a: impl Iterator<Item = T>, capacity: usize) -> Vec<u32>
+fn arg_unique<T>(a: impl Iterator<Item = T>, capacity: usize) -> AlignedVec<u32>
 where
     T: Hash + Eq,
 {
     let mut set = HashSet::with_capacity_and_hasher(capacity, RandomState::new());
-    let mut unique = Vec::with_capacity(capacity);
+    let mut unique = AlignedVec::with_capacity_aligned(capacity);
     a.enumerate().for_each(|(idx, val)| {
         if set.insert(val) {
             unique.push(idx as u32)
@@ -120,17 +120,13 @@ where
     unique
 }
 
-fn arg_unique_ca<'a, T>(ca: &'a ChunkedArray<T>) -> Vec<u32>
-where
-    &'a ChunkedArray<T>: IntoIterator + IntoNoNullIterator,
-    T: 'a,
-    <&'a ChunkedArray<T> as IntoIterator>::Item: Eq + Hash,
-    <&'a ChunkedArray<T> as IntoNoNullIterator>::Item: Eq + Hash,
-{
-    match ca.null_count() {
-        0 => arg_unique(ca.into_no_null_iter(), ca.len()),
-        _ => arg_unique(ca.into_iter(), ca.len()),
-    }
+macro_rules! arg_unique_ca {
+    ($ca:expr) => {{
+        match $ca.null_count() {
+            0 => arg_unique($ca.into_no_null_iter(), $ca.len()),
+            _ => arg_unique($ca.into_iter(), $ca.len()),
+        }
+    }};
 }
 
 macro_rules! impl_value_counts {
@@ -160,8 +156,11 @@ where
         Ok(Self::new_from_opt_iter(self.name(), set.iter().copied()))
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
-        Ok(arg_unique_ca(self))
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
+        Ok(UInt32Chunked::new_from_aligned_vec(
+            self.name(),
+            arg_unique_ca!(self),
+        ))
     }
 
     fn is_unique(&self) -> Result<BooleanChunked> {
@@ -186,8 +185,11 @@ impl ChunkUnique<Utf8Type> for Utf8Chunked {
         ))
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
-        Ok(arg_unique_ca(self))
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
+        Ok(UInt32Chunked::new_from_aligned_vec(
+            self.name(),
+            arg_unique_ca!(self),
+        ))
     }
 
     fn is_unique(&self) -> Result<BooleanChunked> {
@@ -210,8 +212,11 @@ impl ChunkUnique<CategoricalType> for CategoricalChunked {
         ca.cast()
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
-        Ok(arg_unique_ca(self))
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
+        Ok(UInt32Chunked::new_from_aligned_vec(
+            self.name(),
+            arg_unique_ca!(self),
+        ))
     }
 
     fn is_unique(&self) -> Result<BooleanChunked> {
@@ -226,6 +231,7 @@ impl ChunkUnique<CategoricalType> for CategoricalChunked {
     }
 }
 
+#[cfg(feature = "dtype-u8")]
 fn dummies_helper(mut groups: Vec<u32>, len: usize, name: &str) -> UInt8Chunked {
     groups.sort_unstable();
 
@@ -233,6 +239,24 @@ fn dummies_helper(mut groups: Vec<u32>, len: usize, name: &str) -> UInt8Chunked 
     let mut av = AlignedVec::with_capacity_aligned(len);
     for _ in 0..len {
         av.push(0u8)
+    }
+
+    for idx in groups {
+        let elem = unsafe { av.inner.get_unchecked_mut(idx as usize) };
+        *elem = 1;
+    }
+
+    ChunkedArray::new_from_aligned_vec(name, av)
+}
+
+#[cfg(not(feature = "dtype-u8"))]
+fn dummies_helper(mut groups: Vec<u32>, len: usize, name: &str) -> Int64Chunked {
+    groups.sort_unstable();
+
+    // let mut group_member_iter = groups.into_iter();
+    let mut av = AlignedVec::with_capacity_aligned(len);
+    for _ in 0..len {
+        av.push(0i64)
     }
 
     for idx in groups {
@@ -315,8 +339,11 @@ impl ChunkUnique<BooleanType> for BooleanChunked {
         Ok(ChunkedArray::new_from_opt_slice(self.name(), &unique))
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
-        Ok(arg_unique_ca(self))
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
+        Ok(UInt32Chunked::new_from_aligned_vec(
+            self.name(),
+            arg_unique_ca!(self),
+        ))
     }
 
     fn is_unique(&self) -> Result<BooleanChunked> {
@@ -357,7 +384,7 @@ where
     )
 }
 
-fn float_arg_unique<T>(ca: &ChunkedArray<T>) -> Vec<u32>
+fn float_arg_unique<T>(ca: &ChunkedArray<T>) -> AlignedVec<u32>
 where
     T: PolarsFloatType,
     T::Native: IntegerDecode,
@@ -377,8 +404,11 @@ impl ChunkUnique<Float32Type> for Float32Chunked {
         Ok(float_unique(self))
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
-        Ok(float_arg_unique(self))
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
+        Ok(UInt32Chunked::new_from_aligned_vec(
+            self.name(),
+            float_arg_unique(self),
+        ))
     }
 
     fn is_unique(&self) -> Result<BooleanChunked> {
@@ -397,8 +427,11 @@ impl ChunkUnique<Float64Type> for Float64Chunked {
         Ok(float_unique(self))
     }
 
-    fn arg_unique(&self) -> Result<Vec<u32>> {
-        Ok(float_arg_unique(self))
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
+        Ok(UInt32Chunked::new_from_aligned_vec(
+            self.name(),
+            float_arg_unique(self),
+        ))
     }
 
     fn is_unique(&self) -> Result<BooleanChunked> {
@@ -443,7 +476,7 @@ mod test {
         let ca = ChunkedArray::<Int32Type>::new_from_slice("a", &[1, 2, 1, 1, 3]);
         assert_eq!(
             ca.arg_unique().unwrap().into_iter().collect_vec(),
-            vec![0, 1, 4]
+            vec![Some(0), Some(1), Some(4)]
         );
     }
 

@@ -67,10 +67,9 @@ macro_rules! impl_quantile {
         let null_count = $self.null_count();
         let opt = ChunkSort::sort($self, false)
             .slice(
-                ((($self.len() - null_count) as f64) * $quantile + null_count as f64) as usize,
+                ((($self.len() - null_count) as f64) * $quantile + null_count as f64) as i64,
                 1,
             )
-            .unwrap()
             .into_iter()
             .next()
             .unwrap();
@@ -84,9 +83,8 @@ where
     T::Native: PartialOrd + Num + NumCast + Zero,
 {
     fn sum(&self) -> Option<T::Native> {
-        self.downcast_chunks()
-            .iter()
-            .map(|&a| compute::sum(a))
+        self.downcast_iter()
+            .map(|a| compute::sum(a))
             .fold(None, |acc, v| match v {
                 Some(v) => match acc {
                     None => Some(v),
@@ -101,9 +99,8 @@ where
             DataType::Float32 => agg_float_with_nans!(self, min, f32),
             DataType::Float64 => agg_float_with_nans!(self, min, f64),
             _ => self
-                .downcast_chunks()
-                .iter()
-                .filter_map(|&a| compute::min(a))
+                .downcast_iter()
+                .filter_map(|a| compute::min(a))
                 .fold_first_(|acc, v| if acc < v { acc } else { v }),
         }
     }
@@ -113,21 +110,35 @@ where
             DataType::Float32 => agg_float_with_nans!(self, max, f32),
             DataType::Float64 => agg_float_with_nans!(self, max, f64),
             _ => self
-                .downcast_chunks()
-                .iter()
-                .filter_map(|&a| compute::max(a))
+                .downcast_iter()
+                .filter_map(|a| compute::max(a))
                 .fold_first_(|acc, v| if acc > v { acc } else { v }),
         }
     }
 
-    fn mean(&self) -> Option<T::Native> {
+    fn mean(&self) -> Option<f64> {
         let len = (self.len() - self.null_count()) as f64;
-        self.sum()
-            .map(|v| NumCast::from(v.to_f64().unwrap() / len).unwrap())
+        self.sum().map(|v| v.to_f64().unwrap() / len)
     }
 
-    fn median(&self) -> Option<T::Native> {
-        self.quantile(0.5).unwrap()
+    fn median(&self) -> Option<f64> {
+        let null_count = self.null_count();
+        let value_len = self.len() - null_count;
+        match value_len {
+            0 => None,
+            _ => {
+                let sorted = ChunkSort::sort(self, false);
+
+                // After sorting the nulls are at the start of the array.
+                let mid = value_len / 2 + null_count;
+                if value_len % 2 == 0 {
+                    NumCast::from(sorted.get(mid - 1).unwrap() + sorted.get(mid).unwrap())
+                        .map(|v: f64| v / 2.0)
+                } else {
+                    sorted.get(mid).map(|v| NumCast::from(v).unwrap())
+                }
+            }
+        }
     }
 
     fn quantile(&self, quantile: f64) -> Result<Option<T::Native>> {
@@ -144,12 +155,14 @@ where
 
 macro_rules! impl_var {
     ($self:expr, $ty: ty) => {{
-        let mean = $self.mean()?;
-        let ca = $self - mean;
+        let ca = $self - $self.mean()?;
         let squared = &ca * &ca;
-        let opt_v = squared.sum();
-        let div = ($self.len() - 1) as $ty;
-        opt_v.map(|v| v / div)
+        // Note, this is similar behavior to numpy if DDOF=1.
+        // in statistics DDOF often = 1.
+        // this last step is similar to mean, only now instead of 1/n it is 1/(n-1)
+        squared
+            .sum()
+            .map(|sum| sum / (ca.len() - ca.null_count() - 1) as $ty)
     }};
 }
 
@@ -169,7 +182,7 @@ where
 
 impl ChunkVar<f32> for Float32Chunked {
     fn var(&self) -> Option<f32> {
-        impl_var!(self, f32)
+        impl_var!(self, f32).map(|v| v as f32)
     }
     fn std(&self) -> Option<f32> {
         self.var().map(|var| var.sqrt())
@@ -239,27 +252,10 @@ impl ChunkAgg<u32> for BooleanChunked {
         }
         Some(min_max_helper(self, false))
     }
-
-    fn mean(&self) -> Option<u32> {
-        let len = self.len() - self.null_count();
-        self.sum().map(|v| (v as usize / len) as u32)
-    }
-
-    fn median(&self) -> Option<u32> {
-        self.quantile(0.5).unwrap()
-    }
-
-    fn quantile(&self, quantile: f64) -> Result<Option<u32>> {
-        if !(0.0..=1.0).contains(&quantile) {
-            Err(PolarsError::ValueError(
-                "quantile should be between 0.0 and 1.0".into(),
-            ))
-        } else {
-            let opt = impl_quantile!(self, quantile);
-            Ok(opt.map(|v| v as u32))
-        }
-    }
 }
+
+impl ChunkAgg<Series> for ListChunked {}
+impl ChunkAgg<String> for Utf8Chunked {}
 
 // Needs the same trait bounds as the implementation of ChunkedArray<T> of dyn Series
 impl<T> ChunkAggSeries for ChunkedArray<T>
@@ -287,16 +283,16 @@ where
         ca.into_series()
     }
     fn mean_as_series(&self) -> Series {
-        let s = self.sum_as_series();
-        let mut out = s.cast::<Float64Type>().unwrap() / self.len() as f64;
-        out.rename(self.name());
-        out
+        if self.null_count() == self.len() {
+            Self::full_null(self.name(), 1).into_series()
+        } else {
+            let val = [self.mean()];
+            Series::new(self.name(), val)
+        }
     }
     fn median_as_series(&self) -> Series {
-        let v = self.median();
-        let mut ca: ChunkedArray<T> = [v].iter().copied().collect();
-        ca.rename(self.name());
-        ca.into_series()
+        let val = [self.median()];
+        Series::new(self.name(), val)
     }
     fn quantile_as_series(&self, quantile: f64) -> Result<Series> {
         let v = self.quantile(quantile)?;
@@ -416,22 +412,13 @@ impl ChunkAggSeries for BooleanChunked {
         ca.into_series()
     }
     fn mean_as_series(&self) -> Series {
-        let v = ChunkAgg::mean(self);
-        let mut ca: UInt32Chunked = [v].iter().copied().collect();
-        ca.rename(self.name());
-        ca.into_series()
+        BooleanChunked::full_null(self.name(), 1).into_series()
     }
     fn median_as_series(&self) -> Series {
-        let v = ChunkAgg::median(self);
-        let mut ca: UInt32Chunked = [v].iter().copied().collect();
-        ca.rename(self.name());
-        ca.into_series()
+        BooleanChunked::full_null(self.name(), 1).into_series()
     }
-    fn quantile_as_series(&self, quantile: f64) -> Result<Series> {
-        let v = ChunkAgg::quantile(self, quantile)?;
-        let mut ca: UInt32Chunked = [v].iter().copied().collect();
-        ca.rename(self.name());
-        Ok(ca.into_series())
+    fn quantile_as_series(&self, _quantile: f64) -> Result<Series> {
+        Ok(BooleanChunked::full_null(self.name(), 1).into_series())
     }
 }
 
@@ -498,9 +485,62 @@ impl ChunkAggSeries for ListChunked {
 #[cfg(feature = "object")]
 impl<T> ChunkAggSeries for ObjectChunked<T> {}
 
+impl<T> ArgAgg for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+{
+    fn arg_min(&self) -> Option<usize> {
+        self.into_iter()
+            .enumerate()
+            .reduce(|acc, (idx, val)| if acc.1 > val { (idx, val) } else { acc })
+            .map(|tpl| tpl.0)
+    }
+    fn arg_max(&self) -> Option<usize> {
+        self.into_iter()
+            .enumerate()
+            .reduce(|acc, (idx, val)| if acc.1 < val { (idx, val) } else { acc })
+            .map(|tpl| tpl.0)
+    }
+}
+
+impl ArgAgg for BooleanChunked {}
+impl ArgAgg for CategoricalChunked {}
+impl ArgAgg for Utf8Chunked {}
+impl ArgAgg for ListChunked {}
+
+#[cfg(feature = "object")]
+impl<T> ArgAgg for ObjectChunked<T> {}
+
 #[cfg(test)]
 mod test {
     use crate::prelude::*;
+
+    #[test]
+    fn test_var() {
+        // validated with numpy
+        // Note that numpy as an argument ddof wich influences results. The default is ddof=0
+        // we chose ddof=1, which is standard in statistics
+        let ca1 = Int32Chunked::new_from_slice("", &[5, 8, 9, 5, 0]);
+        let ca2 = Int32Chunked::new_from_opt_slice(
+            "",
+            &[
+                Some(5),
+                None,
+                Some(8),
+                Some(9),
+                None,
+                Some(5),
+                Some(0),
+                None,
+            ],
+        );
+        for ca in &[ca1, ca2] {
+            let out = ca.var();
+            assert_eq!(out, Some(12.3));
+            let out = ca.std().unwrap();
+            assert!((3.5071355833500366 - out).abs() < 0.000000001);
+        }
+    }
 
     #[test]
     fn test_agg_float() {
@@ -519,7 +559,7 @@ mod test {
             "a",
             &[Some(2), Some(1), None, Some(3), Some(5), None, Some(4)],
         );
-        assert_eq!(ca.median(), Some(3));
+        assert_eq!(ca.median(), Some(3.0));
         let ca = UInt32Chunked::new_from_opt_slice(
             "a",
             &[
@@ -535,6 +575,53 @@ mod test {
                 Some(4),
             ],
         );
-        assert_eq!(ca.median(), Some(4));
+        assert_eq!(ca.median(), Some(4.0));
+
+        let ca = Float32Chunked::new_from_slice(
+            "",
+            &[
+                0.166189,
+                0.166559,
+                0.168517,
+                0.169393,
+                0.175272,
+                0.23316699999999999,
+                0.238787,
+                0.266562,
+                0.26903,
+                0.285792,
+                0.292801,
+                0.29342899999999994,
+                0.30170600000000003,
+                0.308534,
+                0.331489,
+                0.346095,
+                0.36764399999999997,
+                0.36993899999999996,
+                0.37207399999999996,
+                0.41014000000000006,
+                0.415789,
+                0.421781,
+                0.4277250000000001,
+                0.46536299999999997,
+                0.500208,
+                2.6217269999999995,
+                2.803311,
+                3.868526,
+            ],
+        );
+        assert!((ca.median().unwrap() - 0.3200115).abs() < 0.0001)
+    }
+
+    #[test]
+    fn test_mean() {
+        let ca = Float32Chunked::new_from_opt_slice("", &[Some(1.0), Some(2.0), None]);
+        assert_eq!(ca.mean().unwrap(), 1.5);
+        // all mean_as_series are cast to f64.
+        assert_eq!(ca.mean_as_series().f64().unwrap().get(0).unwrap(), 1.5);
+        // all null values case
+        let ca = Float32Chunked::full_null("", 3);
+        assert_eq!(ca.mean(), None);
+        assert_eq!(ca.mean_as_series().f32().unwrap().get(0), None);
     }
 }

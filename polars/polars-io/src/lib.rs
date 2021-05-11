@@ -1,5 +1,10 @@
-#[cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
+#[cfg(feature = "csv-file")]
+#[cfg_attr(docsrs, doc(cfg(feature = "csv-file")))]
 pub mod csv;
+#[cfg(feature = "csv-file")]
+#[cfg_attr(docsrs, doc(cfg(feature = "csv-file")))]
 pub mod csv_core;
 #[cfg(feature = "ipc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ipc")))]
@@ -17,8 +22,6 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use polars_core::prelude::*;
-use polars_core::utils::accumulate_dataframes_vertical;
-use std::convert::TryFrom;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 
@@ -78,6 +81,7 @@ impl<R: Read> ArrowReader for ArrowJsonReader<R> {
     }
 }
 
+#[cfg(any(feature = "ipc", feature = "parquet", feature = "json"))]
 pub(crate) fn finish_reader<R: ArrowReader>(
     mut reader: R,
     rechunk: bool,
@@ -85,6 +89,9 @@ pub(crate) fn finish_reader<R: ArrowReader>(
     predicate: Option<Arc<dyn PhysicalIoExpr>>,
     aggregate: Option<&[ScanAggregation]>,
 ) -> Result<DataFrame> {
+    use polars_core::utils::accumulate_dataframes_vertical;
+    use std::convert::TryFrom;
+
     let mut n_rows = 0;
     let mut parsed_dfs = Vec::with_capacity(1024);
 
@@ -102,8 +109,8 @@ pub(crate) fn finish_reader<R: ArrowReader>(
         if let Some(aggregate) = aggregate {
             let cols = aggregate
                 .iter()
-                .map(|scan_agg| scan_agg.evaluate_batch(&df).unwrap())
-                .collect();
+                .map(|scan_agg| scan_agg.evaluate_batch(&df))
+                .collect::<Result<_>>()?;
             if cfg!(debug_assertions) {
                 df = DataFrame::new(cols).unwrap();
             } else {
@@ -123,8 +130,8 @@ pub(crate) fn finish_reader<R: ArrowReader>(
     if let Some(aggregate) = aggregate {
         let cols = aggregate
             .iter()
-            .map(|scan_agg| scan_agg.finish(&df).unwrap())
-            .collect();
+            .map(|scan_agg| scan_agg.finish(&df))
+            .collect::<Result<_>>()?;
         df = DataFrame::new_no_checks(cols)
     }
 
@@ -159,6 +166,7 @@ pub enum ScanAggregation {
 
 impl ScanAggregation {
     /// Evaluate the aggregations per batch.
+    #[cfg(any(feature = "ipc", feature = "parquet", feature = "json"))]
     pub(crate) fn evaluate_batch(&self, df: &DataFrame) -> Result<Series> {
         use ScanAggregation::*;
         let s = match self {

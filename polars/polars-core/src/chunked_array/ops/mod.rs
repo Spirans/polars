@@ -3,7 +3,7 @@ use crate::chunked_array::builder::get_list_builder;
 #[cfg(feature = "object")]
 use crate::chunked_array::object::ObjectType;
 use crate::prelude::*;
-use crate::series::implementations::Wrap;
+use crate::series::implementations::SeriesWrap;
 use crate::utils::NoNull;
 use arrow::array::{ArrayRef, UInt32Array};
 use std::marker::Sized;
@@ -12,9 +12,13 @@ pub(crate) mod aggregate;
 pub(crate) mod apply;
 pub(crate) mod chunkops;
 pub(crate) mod cum_agg;
+pub(crate) mod downcast;
 pub(crate) mod explode;
 pub(crate) mod fill_none;
 pub(crate) mod filter;
+#[cfg(feature = "is_in")]
+#[cfg_attr(docsrs, doc(cfg(feature = "is_in")))]
+pub(crate) mod is_in;
 pub(crate) mod peaks;
 pub(crate) mod set;
 pub(crate) mod shift;
@@ -40,10 +44,13 @@ pub trait ChunkCumAgg<T> {
     }
 }
 
+/// Traverse and collect every nth element
 pub trait ChunkTakeEvery<T> {
+    /// Traverse and collect every nth element in a new array.
     fn take_every(&self, n: usize) -> ChunkedArray<T>;
 }
 
+/// Explode/ flatten a
 pub trait ChunkExplode {
     fn explode(&self) -> Result<Series> {
         self.explode_and_offsets().map(|t| t.0)
@@ -55,6 +62,7 @@ pub trait ChunkBytes {
     fn to_byte_slices(&self) -> Vec<&[u8]>;
 }
 
+/// Rolling window functions
 pub trait ChunkWindow {
     /// apply a rolling sum (moving sum) over the values in this array.
     /// a window of length `window_size` will traverse the array. the values that fill this window
@@ -71,9 +79,10 @@ pub trait ChunkWindow {
     ///                     `false` -> Any Null in the window leads to a Null in the aggregation result.
     fn rolling_sum(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Self>
     where
         Self: std::marker::Sized,
@@ -95,11 +104,13 @@ pub trait ChunkWindow {
     /// * `ignore_null` - Toggle behavior of aggregation regarding null values in the window.
     ///                     `true` -> Null values will be ignored.
     ///                     `false` -> Any Null in the window leads to a Null in the aggregation result.
+    /// * `min_periods` -  Amount of elements in the window that should be filled before computing a result.
     fn rolling_mean(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Self>
     where
         Self: std::marker::Sized,
@@ -122,11 +133,13 @@ pub trait ChunkWindow {
     /// * `ignore_null` - Toggle behavior of aggregation regarding null values in the window.
     ///                     `true` -> Null values will be ignored.
     ///                     `false` -> Any Null in the window leads to a Null in the aggregation result.
+    /// * `min_periods` -  Amount of elements in the window that should be filled before computing a result.
     fn rolling_min(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Self>
     where
         Self: std::marker::Sized,
@@ -149,11 +162,13 @@ pub trait ChunkWindow {
     /// * `ignore_null` - Toggle behavior of aggregation regarding null values in the window.
     ///                     `true` -> Null values will be ignored.
     ///                     `false` -> Any Null in the window leads to a Null in the aggregation result.
+    /// * `min_periods` -  Amount of elements in the window that should be filled before computing a result.
     fn rolling_max(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Self>
     where
         Self: std::marker::Sized,
@@ -164,6 +179,7 @@ pub trait ChunkWindow {
     }
 }
 
+/// Custom rolling window functions
 pub trait ChunkWindowCustom<T> {
     /// Apply a rolling aggregation over the values in this array.
     ///
@@ -180,12 +196,14 @@ pub trait ChunkWindowCustom<T> {
     /// * `window_size` - The length of the window.
     /// * `weight` - An optional slice with the same length of the window that will be multiplied
     ///              elementwise with the values in the window.
+    /// * `min_periods` -  Amount of elements in the window that should be filled before computing a result.
     fn rolling_custom<F>(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _fold_fn: F,
         _init_fold: InitFold,
+        _min_periods: u32,
     ) -> Result<Self>
     where
         F: Fn(Option<T>, Option<T>) -> Option<T> + Copy,
@@ -251,7 +269,7 @@ pub type TakeIdxIterNull<'a, INull> = TakeIdx<'a, Dummy<usize>, INull>;
 impl<'a> From<&'a UInt32Chunked> for TakeIdx<'a, Dummy<usize>, Dummy<Option<usize>>> {
     fn from(ca: &'a UInt32Chunked) -> Self {
         if ca.chunks.len() == 1 {
-            TakeIdx::Array(ca.downcast_chunks()[0])
+            TakeIdx::Array(ca.downcast_iter().next().unwrap())
         } else {
             panic!("implementation error, should be transformed to an iterator by the caller")
         }
@@ -267,11 +285,11 @@ where
     }
 }
 
-impl<'a, INulls> From<Wrap<INulls>> for TakeIdx<'a, Dummy<usize>, INulls>
+impl<'a, INulls> From<SeriesWrap<INulls>> for TakeIdx<'a, Dummy<usize>, INulls>
 where
     INulls: Iterator<Item = Option<usize>>,
 {
-    fn from(iter: Wrap<INulls>) -> Self {
+    fn from(iter: SeriesWrap<INulls>) -> Self {
         TakeIdx::IterNulls(iter.0)
     }
 }
@@ -375,6 +393,8 @@ pub trait ChunkCast {
     fn cast<N>(&self) -> Result<ChunkedArray<N>>
     where
         N: PolarsDataType;
+
+    fn cast_with_dtype(&self, data_type: &DataType) -> Result<Series>;
 }
 
 /// Fastest way to do elementwise operations on a ChunkedArray<T> when the operation is cheaper than
@@ -427,24 +447,36 @@ pub trait ChunkApply<'a, A, B> {
 pub trait ChunkAgg<T> {
     /// Aggregate the sum of the ChunkedArray.
     /// Returns `None` if the array is empty or only contains null values.
-    fn sum(&self) -> Option<T>;
+    fn sum(&self) -> Option<T> {
+        None
+    }
 
-    fn min(&self) -> Option<T>;
+    fn min(&self) -> Option<T> {
+        None
+    }
     /// Returns the maximum value in the array, according to the natural order.
     /// Returns `None` if the array is empty or only contains null values.
-    fn max(&self) -> Option<T>;
+    fn max(&self) -> Option<T> {
+        None
+    }
 
     /// Returns the mean value in the array.
     /// Returns `None` if the array is empty or only contains null values.
-    fn mean(&self) -> Option<T>;
+    fn mean(&self) -> Option<f64> {
+        None
+    }
 
     /// Returns the mean value in the array.
     /// Returns `None` if the array is empty or only contains null values.
-    fn median(&self) -> Option<T>;
+    fn median(&self) -> Option<f64> {
+        None
+    }
 
     /// Aggregate a given quantile of the ChunkedArray.
     /// Returns `None` if the array is empty or only contains null values.
-    fn quantile(&self, quantile: f64) -> Result<Option<T>>;
+    fn quantile(&self, _quantile: f64) -> Result<Option<T>> {
+        Ok(None)
+    }
 }
 
 /// Variance and standard deviation aggregation.
@@ -507,7 +539,7 @@ pub trait ChunkUnique<T> {
 
     /// Get first index of the unique values in a `ChunkedArray`.
     /// This Vec is sorted.
-    fn arg_unique(&self) -> Result<Vec<u32>>;
+    fn arg_unique(&self) -> Result<UInt32Chunked>;
 
     /// Number of unique values in the `ChunkedArray`
     fn n_unique(&self) -> Result<usize> {
@@ -554,15 +586,35 @@ pub trait ChunkSort<T> {
 
     /// Retrieve the indexes needed to sort this array.
     fn argsort(&self, reverse: bool) -> UInt32Chunked;
+
+    /// Retrieve the indexes need to sort this and the other arrays.
+    fn argsort_multiple(&self, _other: &[Series], _reverse: &[bool]) -> Result<UInt32Chunked> {
+        Err(PolarsError::InvalidOperation(
+            "argsort_multiple not implemented for this dtype".into(),
+        ))
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
 pub enum FillNoneStrategy {
+    /// previous value in array
     Backward,
+    /// next value in array
     Forward,
+    /// mean value of array
     Mean,
+    /// minimal value in array
     Min,
+    /// maximum value in array
     Max,
+    /// replace with the value zero
+    Zero,
+    /// replace with the value one
+    One,
+    /// replace with the maximum value of that data type
+    MaxBound,
+    /// replace with the minimal value of that data type
+    MinBound,
 }
 
 /// Replace None values with various strategies
@@ -844,6 +896,7 @@ pub trait ChunkApplyKernel<A> {
         S: PolarsDataType;
 }
 
+/// Find local minima/ maxima
 pub trait ChunkPeaks {
     /// Get a boolean mask of the local maximum peaks.
     fn peak_max(&self) -> BooleanChunked {
@@ -853,5 +906,27 @@ pub trait ChunkPeaks {
     /// Get a boolean mask of the local minimum peaks.
     fn peak_min(&self) -> BooleanChunked {
         unimplemented!()
+    }
+}
+
+/// Check if element is member of list array
+#[cfg(feature = "is_in")]
+#[cfg_attr(docsrs, doc(cfg(feature = "is_in")))]
+pub trait IsIn {
+    /// Check if elements of this array are in the right Series, or List values of the right Series.
+    fn is_in(&self, _other: &Series) -> Result<BooleanChunked> {
+        unimplemented!()
+    }
+}
+
+/// Argmin/ Argmax
+pub trait ArgAgg {
+    /// Get the index of the minimal value
+    fn arg_min(&self) -> Option<usize> {
+        None
+    }
+    /// Get the index of the maximal value
+    fn arg_max(&self) -> Option<usize> {
+        None
     }
 }

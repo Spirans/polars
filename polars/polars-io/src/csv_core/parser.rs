@@ -1,4 +1,5 @@
 use super::buffer::*;
+use crate::csv::CsvEncoding;
 use num::traits::Pow;
 use polars_core::prelude::*;
 
@@ -6,7 +7,7 @@ use polars_core::prelude::*;
 /// credits to csv-core
 pub(crate) fn skip_bom(input: &[u8]) -> &[u8] {
     if input.len() >= 3 && &input[0..3] == b"\xef\xbb\xbf" {
-        &input[..3]
+        &input[3..]
     } else {
         input
     }
@@ -38,7 +39,7 @@ pub(crate) fn next_line_position(
         return None;
     }
     loop {
-        let pos = input.iter().position(|b| *b == b'\n')?;
+        let pos = input.iter().position(|b| *b == b'\n')? + 1;
         if input.len() - pos == 0 {
             return None;
         }
@@ -80,7 +81,8 @@ where
         return (input, 0);
     }
     let mut read = 0;
-    loop {
+    let len = input.len();
+    while read < len {
         let b = input[read];
         if !f(b) {
             break;
@@ -103,9 +105,23 @@ pub(crate) fn skip_header(input: &[u8]) -> (&[u8], usize) {
 }
 
 /// Remove whitespace and line endings from the start of file.
-#[inline]
 pub(crate) fn skip_whitespace(input: &[u8]) -> (&[u8], usize) {
     skip_condition(input, |b| is_whitespace(b) || is_line_ending(b))
+}
+
+/// Local version of slice::starts_with (as it won't inline)
+fn starts_with(bytes: &[u8], needle: u8) -> bool {
+    !bytes.is_empty() && bytes[0] == needle
+}
+
+/// Slice `"100"` to `100`, if slice starts with `"` it does not check that it ends with `"`, but
+/// assumes this. Be aware of this.
+pub(crate) fn drop_quotes(input: &[u8]) -> &[u8] {
+    if starts_with(input, b'"') {
+        &input[1..input.len() - 1]
+    } else {
+        input
+    }
 }
 
 pub(crate) fn skip_line_ending(input: &[u8]) -> (&[u8], usize) {
@@ -299,6 +315,7 @@ impl<'a> Iterator for SplitFields<'a> {
 /// * `projection` - Indices of the columns to project.
 /// * `buffers` - Parsed output will be written to these buffers. Except for UTF8 data. The offsets of the
 ///               fields are written to the buffers. The UTF8 data will be parsed later.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn parse_lines(
     bytes: &[u8],
     offset: usize,
@@ -306,7 +323,9 @@ pub(crate) fn parse_lines(
     projection: &[usize],
     buffers: &mut [Buffer],
     ignore_parser_errors: bool,
-) -> Result<()> {
+    encoding: CsvEncoding,
+    n_lines: usize,
+) -> Result<usize> {
     // This variable will store the number of bytes we read. It is important to do this bookkeeping
     // to be able to correctly parse the strings later.
     let mut read = offset;
@@ -318,7 +337,7 @@ pub(crate) fn parse_lines(
     // the length of the string field. We also store the total length of processed string fields per column.
     // Later we use that meta information to exactly allocate the required buffers and parse the strings.
     let iter_lines = SplitLines::new(bytes, b'\n');
-    for mut line in iter_lines {
+    for mut line in iter_lines.take(n_lines) {
         let len = line.len();
 
         // two adjacent '\n\n' will lead to an empty line.
@@ -358,17 +377,18 @@ pub(crate) fn parse_lines(
                     buffers.get_unchecked_mut(processed_fields)
                 };
                 // let buf = &mut buffers[processed_fields];
-                buf.add(field, ignore_parser_errors, read).map_err(|e| {
-                    PolarsError::Other(
-                        format!(
-                            "{:?} on thread line {}; on input: {}",
-                            e,
-                            idx,
-                            String::from_utf8_lossy(field)
+                buf.add(field, ignore_parser_errors, read, encoding)
+                    .map_err(|e| {
+                        PolarsError::Other(
+                            format!(
+                                "{:?} on thread line {}; on input: {}",
+                                e,
+                                idx,
+                                String::from_utf8_lossy(field)
+                            )
+                            .into(),
                         )
-                        .into(),
-                    )
-                })?;
+                    })?;
 
                 processed_fields += 1;
 
@@ -383,17 +403,31 @@ pub(crate) fn parse_lines(
             // +1 is the split character that is consumed by the iterator.
             read += field.len() + 1;
         }
+
+        // there can be lines that miss fields (also the comma values)
+        // this means the splitter won't process them.
+        // We traverse them to read them as null values.
+        while processed_fields < projection.len() {
+            debug_assert!(processed_fields < buffers.len());
+            let buf = unsafe {
+                // SAFETY: processed fields index can never exceed the projection indices.
+                buffers.get_unchecked_mut(processed_fields)
+            };
+
+            buf.add(&[], true, read, encoding)?;
+            processed_fields += 1;
+        }
+
         // this way we also include the trailing '\n' or '\r\n' in the bytes read
         // and any skipped fields.
         read = read_sol + line_length;
     }
-    Ok(())
+    Ok(read)
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use std::io::Read;
 
     #[test]
     fn test_skip() {
@@ -404,69 +438,5 @@ mod test {
         let input = b"\t\n\r
         hello";
         assert_eq!(skip_whitespace(input).0, b"hello");
-    }
-
-    #[test]
-    fn test_parse_lines() {
-        let path = "../../examples/aggregate_multiple_files_in_chunks/datasets/foods1.csv";
-        let mut file = std::fs::File::open(path).unwrap();
-        let mut input = vec![];
-        file.read_to_end(&mut input).unwrap();
-        let bytes = skip_header(skip_whitespace(&input).0).0;
-
-        // after a skip header, we should not have a new line char.
-        assert_ne!(bytes[0], b'\n');
-        dbg!(std::str::from_utf8(bytes).unwrap());
-
-        let mut buffers = vec![
-            Buffer::Utf8(vec![], 0),
-            Buffer::UInt64(vec![]),
-            Buffer::Float64(vec![]),
-            Buffer::Float64(vec![]),
-        ];
-
-        macro_rules! call_buff_method {
-            ($buf: expr, $method:ident) => {{
-                use Buffer::*;
-                match $buf {
-                    Boolean(a) => a.$method(),
-                    Int32(a) => a.$method(),
-                    Int64(a) => a.$method(),
-                    UInt64(a) => a.$method(),
-                    UInt32(a) => a.$method(),
-                    Float32(a) => a.$method(),
-                    Float64(a) => a.$method(),
-                    Utf8(a, _) => a.$method(),
-                }
-            }};
-        }
-
-        let projection = &[0, 1, 2, 3];
-
-        parse_lines(&bytes, 0, b',', projection, &mut buffers, false).unwrap();
-        // check if all buffers are correctly filled.
-        for buf in &buffers {
-            let len = call_buff_method!(buf, len);
-            assert_eq!(len, 27);
-        }
-
-        dbg!(&buffers[0]);
-        // check if we can reconstruct the correct strings from the accumulated offsets.
-        if let Buffer::Utf8(buf, len) = &buffers[0] {
-            let v = buf
-                .iter()
-                .map(|utf8_field| {
-                    let sub_slice = utf8_field.get_long_subslice(bytes);
-                    std::str::from_utf8(&sub_slice[..sub_slice.len() - 1]).unwrap()
-                })
-                .collect::<Vec<_>>();
-
-            let total_len: usize = v.iter().map(|s| s.len()).sum();
-            assert_eq!(total_len, *len);
-
-            assert_eq!(&v[0], &"vegetables");
-            assert_eq!(&v[v.len() - 1], &"fruit");
-            dbg!(v);
-        }
     }
 }

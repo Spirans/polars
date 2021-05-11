@@ -25,6 +25,25 @@ def test_apply():
     new = df.lazy().with_column(col("a").map(lambda s: s * 2).alias("foo")).collect()
 
 
+def test_add_eager_column():
+    df = DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
+    out = df.lazy().with_column(pl.lit(pl.Series("c", [1, 2, 3]))).collect()
+    assert out["c"].sum() == 6
+
+
+def test_set_null():
+    df = DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
+    out = (
+        df.lazy()
+        .with_column(when(col("a") > 1).then(lit(None)).otherwise(100).alias("foo"))
+        .collect()
+    )
+    s = out["foo"]
+    assert s[0] == 100
+    assert s[1] is None
+    assert s[2] is None
+
+
 def test_agg():
     df = DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
     ldf = df.lazy().min()
@@ -83,7 +102,7 @@ def test_apply_custom_function():
     )
 
     # two ways to determine the length groups.
-    (
+    a = (
         df.lazy()
         .groupby("fruits")
         .agg(
@@ -93,7 +112,23 @@ def test_apply_custom_function():
                 pl.count("cars"),
             ]
         )
+        .sort("custom_1", reverse=True)
     ).collect()
+    expected = pl.DataFrame(
+        {
+            "fruits": ["banana", "apple"],
+            "custom_1": [3, 2],
+            "custom_2": [3, 2],
+            "cars_count": [3, 2],
+        }
+    )
+    expected["cars_count"] = expected["cars_count"].cast(pl.UInt32)
+    assert a.frame_equal(expected)
+
+
+def test_groupby():
+    df = pl.DataFrame({"a": [1.0, None, 3.0, 4.0], "groups": ["a", "a", "b", "b"]})
+    out = df.lazy().groupby("groups").agg(pl.mean("a")).collect()
 
 
 def test_shift_and_fill():
@@ -106,3 +141,10 @@ def test_shift_and_fill():
     # use df method
     out = df.lazy().shift_and_fill(2, col("b").std()).collect()
     assert out["a"].null_count() == 0
+
+
+def test_arange():
+    df = pl.DataFrame({"a": [1, 1, 1]}).lazy()
+    result = df.filter(pl.lazy.col("a") >= pl.lazy.arange(0, 3)).collect()
+    expected = pl.DataFrame({"a": [1, 1]})
+    assert result.frame_equal(expected)

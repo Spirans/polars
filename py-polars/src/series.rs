@@ -1,15 +1,19 @@
+use std::any::Any;
+use std::ops::{BitAnd, BitOr};
+
+use numpy::PyArray1;
+use pyo3::types::{PyList, PyTuple};
+use pyo3::{exceptions::PyRuntimeError, prelude::*, Python};
+
+use polars::chunked_array::builder::get_bitmap;
+
+use crate::apply::series::ApplyLambda;
 use crate::arrow_interop::to_rust::array_to_rust;
 use crate::dataframe::PyDataFrame;
 use crate::datatypes::PyDataType;
 use crate::error::PyPolarsEr;
 use crate::utils::str_to_polarstype;
-use crate::{arrow_interop, dispatch::ApplyLambda, npy::aligned_array, prelude::*};
-use numpy::PyArray1;
-use polars::chunked_array::builder::get_bitmap;
-use pyo3::types::{PyList, PyTuple};
-use pyo3::{exceptions::PyRuntimeError, prelude::*, Python};
-use std::any::Any;
-use std::ops::{BitAnd, BitOr};
+use crate::{arrow_interop, npy::aligned_array, prelude::*};
 
 #[derive(Clone, Debug)]
 pub struct ObjectValue {
@@ -247,7 +251,7 @@ impl PySeries {
             self.series = series;
             None
         } else {
-            Some(PySeries::new(series))
+            Some(series.into())
         }
     }
 
@@ -284,7 +288,7 @@ impl PySeries {
     }
 
     pub fn chunk_lengths(&self) -> Vec<usize> {
-        self.series.chunk_lengths().clone()
+        self.series.chunk_lengths().collect()
     }
 
     pub fn name(&self) -> &str {
@@ -300,21 +304,22 @@ impl PySeries {
         dt as u8
     }
 
+    pub fn mean(&self) -> Option<f64> {
+        self.series.mean()
+    }
+
     pub fn n_chunks(&self) -> usize {
         self.series.n_chunks()
     }
 
-    pub fn limit(&self, num_elements: usize) -> PyResult<Self> {
-        let series = self.series.limit(num_elements).map_err(PyPolarsEr::from)?;
-        Ok(PySeries { series })
+    pub fn limit(&self, num_elements: usize) -> Self {
+        let series = self.series.limit(num_elements);
+        series.into()
     }
 
-    pub fn slice(&self, offset: usize, length: usize) -> PyResult<Self> {
-        let series = self
-            .series
-            .slice(offset, length)
-            .map_err(PyPolarsEr::from)?;
-        Ok(PySeries { series })
+    pub fn slice(&self, offset: i64, length: usize) -> Self {
+        let series = self.series.slice(offset, length);
+        series.into()
     }
 
     pub fn append(&mut self, other: &PySeries) -> PyResult<()> {
@@ -334,28 +339,28 @@ impl PySeries {
         }
     }
 
-    pub fn add(&self, other: &PySeries) -> PyResult<Self> {
-        Ok(PySeries::new(&self.series + &other.series))
+    pub fn add(&self, other: &PySeries) -> Self {
+        (&self.series + &other.series).into()
     }
 
-    pub fn sub(&self, other: &PySeries) -> PyResult<Self> {
-        Ok(PySeries::new(&self.series - &other.series))
+    pub fn sub(&self, other: &PySeries) -> Self {
+        (&self.series - &other.series).into()
     }
 
-    pub fn mul(&self, other: &PySeries) -> PyResult<Self> {
-        Ok(PySeries::new(&self.series * &other.series))
+    pub fn mul(&self, other: &PySeries) -> Self {
+        (&self.series * &other.series).into()
     }
 
-    pub fn div(&self, other: &PySeries) -> PyResult<Self> {
-        Ok(PySeries::new(&self.series / &other.series))
+    pub fn div(&self, other: &PySeries) -> Self {
+        (&self.series / &other.series).into()
     }
 
-    pub fn head(&self, length: Option<usize>) -> PyResult<Self> {
-        Ok(PySeries::new(self.series.head(length)))
+    pub fn head(&self, length: Option<usize>) -> Self {
+        (self.series.head(length)).into()
     }
 
-    pub fn tail(&self, length: Option<usize>) -> PyResult<Self> {
-        Ok(PySeries::new(self.series.tail(length)))
+    pub fn tail(&self, length: Option<usize>) -> Self {
+        (self.series.tail(length)).into()
     }
 
     pub fn sort_in_place(&mut self, reverse: bool) {
@@ -366,13 +371,8 @@ impl PySeries {
         PySeries::new(self.series.sort(reverse))
     }
 
-    pub fn argsort(&self, reverse: bool) -> Py<PyArray1<u32>> {
-        let gil = pyo3::Python::acquire_gil();
-        let pyarray = PyArray1::from_iter(
-            gil.python(),
-            self.series.argsort(reverse).into_iter().flatten(),
-        );
-        pyarray.to_owned()
+    pub fn argsort(&self, reverse: bool) -> Self {
+        self.series.argsort(reverse).into_series().into()
     }
 
     pub fn unique(&self) -> PyResult<Self> {
@@ -385,11 +385,17 @@ impl PySeries {
         Ok(df.into())
     }
 
-    pub fn arg_unique(&self) -> PyResult<Py<PyArray1<u32>>> {
-        let gil = pyo3::Python::acquire_gil();
+    pub fn arg_unique(&self) -> PyResult<Self> {
         let arg_unique = self.series.arg_unique().map_err(PyPolarsEr::from)?;
-        let pyarray = PyArray1::from_vec(gil.python(), arg_unique);
-        Ok(pyarray.to_owned())
+        Ok(arg_unique.into_series().into())
+    }
+
+    pub fn arg_min(&self) -> Option<usize> {
+        self.series.arg_min()
+    }
+
+    pub fn arg_max(&self) -> Option<usize> {
+        self.series.arg_max()
     }
 
     pub fn take(&self, indices: Vec<usize>) -> Self {
@@ -568,6 +574,22 @@ impl PySeries {
         pylist.to_object(python)
     }
 
+    pub fn median(&self) -> Option<f64> {
+        self.series.median()
+    }
+
+    pub fn quantile(&self, quantile: f64) -> PyObject {
+        let gil = Python::acquire_gil();
+        let py = gil.python();
+        Wrap(
+            self.series
+                .quantile_as_series(quantile)
+                .expect("invalid quantile")
+                .get(0),
+        )
+        .into_py(py)
+    }
+
     /// Rechunk and return a pointer to the start of the Series.
     /// Only implemented for numeric types
     pub fn as_single_ptr(&mut self) -> PyResult<usize> {
@@ -598,6 +620,11 @@ impl PySeries {
         let py = gil.python();
         let pyarrow = py.import("pyarrow")?;
         arrow_interop::to_py::to_py_array(&self.series.chunks()[0], py, pyarrow)
+    }
+
+    pub fn is_in(&self, other: &PySeries) -> PyResult<Self> {
+        let out = self.series.is_in(&other.series).map_err(PyPolarsEr::from)?;
+        Ok(out.into_series().into())
     }
 
     pub fn clone(&self) -> Self {
@@ -856,6 +883,12 @@ impl PySeries {
         }
     }
 
+    pub fn str_slice(&self, start: i64, length: Option<u64>) -> PyResult<Self> {
+        let ca = self.series.utf8().map_err(PyPolarsEr::from)?;
+        let s = ca.str_slice(start, length).map_err(PyPolarsEr::from)?.into_series();
+        Ok(s.into())
+    }
+
     pub fn datetime_str_fmt(&self, fmt: &str) -> PyResult<Self> {
         let s = self
             .series
@@ -866,13 +899,18 @@ impl PySeries {
 
     pub fn as_duration(&self) -> PyResult<Self> {
         match self.series.dtype() {
-            DataType::Date64 => {
-                let ca = self.series.date64().unwrap().as_duration();
-                Ok(ca.into_series().into())
-            }
+            DataType::Date64 => Ok(self
+                .series
+                .cast::<DurationMillisecondType>()
+                .unwrap()
+                .into_series()
+                .into()),
             DataType::Date32 => {
-                let ca = self.series.date32().unwrap().as_duration();
-                Ok(ca.into_series().into())
+                let s = self.series.cast::<Date64Type>().unwrap() * 3600 * 24 * 1000;
+                Ok(s.cast::<DurationMillisecondType>()
+                    .unwrap()
+                    .into_series()
+                    .into())
             }
             _ => Err(PyPolarsEr::Other(
                 "Only date32 and date64 can be transformed as duration".into(),
@@ -896,101 +934,120 @@ impl PySeries {
     }
     pub fn rolling_sum(
         &self,
-        window_size: usize,
+        window_size: u32,
         weight: Option<Vec<f64>>,
         ignore_null: bool,
+        min_periods: u32,
     ) -> PyResult<Self> {
         let s = self
             .series
-            .rolling_sum(window_size, weight.as_deref(), ignore_null)
+            .rolling_sum(window_size, weight.as_deref(), ignore_null, min_periods)
             .map_err(PyPolarsEr::from)?;
         Ok(s.into())
     }
 
     pub fn rolling_mean(
         &self,
-        window_size: usize,
+        window_size: u32,
         weight: Option<Vec<f64>>,
         ignore_null: bool,
+        min_periods: u32,
     ) -> PyResult<Self> {
         let s = self
             .series
-            .rolling_mean(window_size, weight.as_deref(), ignore_null)
+            .rolling_mean(window_size, weight.as_deref(), ignore_null, min_periods)
             .map_err(PyPolarsEr::from)?;
         Ok(s.into())
     }
 
     pub fn rolling_max(
         &self,
-        window_size: usize,
+        window_size: u32,
         weight: Option<Vec<f64>>,
         ignore_null: bool,
+        min_periods: u32,
     ) -> PyResult<Self> {
         let s = self
             .series
-            .rolling_max(window_size, weight.as_deref(), ignore_null)
+            .rolling_max(window_size, weight.as_deref(), ignore_null, min_periods)
             .map_err(PyPolarsEr::from)?;
         Ok(s.into())
     }
     pub fn rolling_min(
         &self,
-        window_size: usize,
+        window_size: u32,
         weight: Option<Vec<f64>>,
         ignore_null: bool,
+        min_periods: u32,
     ) -> PyResult<Self> {
         let s = self
             .series
-            .rolling_min(window_size, weight.as_deref(), ignore_null)
+            .rolling_min(window_size, weight.as_deref(), ignore_null, min_periods)
             .map_err(PyPolarsEr::from)?;
         Ok(s.into())
     }
 
     pub fn year(&self) -> PyResult<Self> {
         let s = self.series.year().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
     }
 
     pub fn month(&self) -> PyResult<Self> {
         let s = self.series.month().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
+    }
+
+    pub fn weekday(&self) -> PyResult<Self> {
+        let s = self.series.weekday().map_err(PyPolarsEr::from)?;
+        Ok(s.into_series().into())
+    }
+
+    pub fn week(&self) -> PyResult<Self> {
+        let s = self.series.week().map_err(PyPolarsEr::from)?;
+        Ok(s.into_series().into())
     }
 
     pub fn day(&self) -> PyResult<Self> {
         let s = self.series.day().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
     }
 
     pub fn ordinal_day(&self) -> PyResult<Self> {
         let s = self.series.ordinal_day().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
     }
 
     pub fn hour(&self) -> PyResult<Self> {
         let s = self.series.hour().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
     }
 
     pub fn minute(&self) -> PyResult<Self> {
         let s = self.series.minute().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
     }
 
     pub fn second(&self) -> PyResult<Self> {
         let s = self.series.second().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
     }
 
     pub fn nanosecond(&self) -> PyResult<Self> {
         let s = self.series.nanosecond().map_err(PyPolarsEr::from)?;
-        Ok(s.into())
+        Ok(s.into_series().into())
     }
 
-    fn peak_max(&self) -> Self {
+    pub fn peak_max(&self) -> Self {
         self.series.peak_max().into_series().into()
     }
 
-    fn peak_min(&self) -> Self {
+    pub fn peak_min(&self) -> Self {
         self.series.peak_min().into_series().into()
+    }
+
+    pub fn n_unique(&self) -> PyResult<usize> {
+        let n = self.series.n_unique().map_err(PyPolarsEr::from)?;
+        Ok(n)
     }
 }
 
@@ -1114,8 +1171,13 @@ macro_rules! impl_get {
     ($name:ident, $series_variant:ident, $type:ty) => {
         #[pymethods]
         impl PySeries {
-            pub fn $name(&self, index: usize) -> Option<$type> {
+            pub fn $name(&self, index: i64) -> Option<$type> {
                 if let Ok(ca) = self.series.$series_variant() {
+                    let index = if index < 0 {
+                        (ca.len() as i64 + index) as usize
+                    } else {
+                        index as usize
+                    };
                     ca.get(index)
                 } else {
                     None
@@ -1366,28 +1428,6 @@ impl_max!(max_i32, i32);
 impl_max!(max_i64, i64);
 impl_max!(max_f32, f32);
 impl_max!(max_f64, f64);
-
-macro_rules! impl_mean {
-    ($name:ident, $type:ty) => {
-        #[pymethods]
-        impl PySeries {
-            pub fn $name(&self) -> PyResult<Option<$type>> {
-                Ok(self.series.mean())
-            }
-        }
-    };
-}
-
-impl_mean!(mean_u8, u8);
-impl_mean!(mean_u16, u16);
-impl_mean!(mean_u32, u32);
-impl_mean!(mean_u64, u64);
-impl_mean!(mean_i8, i8);
-impl_mean!(mean_i16, i16);
-impl_mean!(mean_i32, i32);
-impl_mean!(mean_i64, i64);
-impl_mean!(mean_f32, f32);
-impl_mean!(mean_f64, f64);
 
 macro_rules! impl_eq_num {
     ($name:ident, $type:ty) => {

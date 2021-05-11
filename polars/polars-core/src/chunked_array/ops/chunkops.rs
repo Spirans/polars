@@ -103,24 +103,24 @@ where
             self.clone()
         } else {
             let mut builder = ObjectChunkedBuilder::new(self.name(), self.len());
-            let chunks = self.downcast_chunks();
+            let chunks = self.downcast_iter();
 
             // todo! use iterators once implemented
             // no_null path
             if self.null_count() == 0 {
-                for idx in 0..self.len() {
-                    let (chunk_idx, idx) = self.index_to_chunked_index(idx);
-                    let arr = unsafe { &**chunks.get_unchecked(chunk_idx) };
-                    builder.append_value(arr.value(idx).clone())
+                for arr in chunks {
+                    for idx in 0..arr.len() {
+                        builder.append_value(arr.value(idx).clone())
+                    }
                 }
             } else {
-                for idx in 0..self.len() {
-                    let (chunk_idx, idx) = self.index_to_chunked_index(idx);
-                    let arr = unsafe { &**chunks.get_unchecked(chunk_idx) };
-                    if arr.is_valid(idx) {
-                        builder.append_value(arr.value(idx).clone())
-                    } else {
-                        builder.append_null()
+                for arr in chunks {
+                    for idx in 0..arr.len() {
+                        if arr.is_valid(idx) {
+                            builder.append_value(arr.value(idx).clone())
+                        } else {
+                            builder.append_null()
+                        }
                     }
                 }
             }
@@ -138,7 +138,7 @@ mod test {
         let s = Series::new("", &["foo", "bar", "spam"]);
         let mut a = s.cast::<CategoricalType>().unwrap();
 
-        a.append(&a.slice(0, 2).unwrap()).unwrap();
+        a.append(&a.slice(0, 2)).unwrap();
         a.rechunk();
         assert!(a.categorical().unwrap().categorical_map.is_some());
     }

@@ -6,8 +6,12 @@ import pytest
 import pyarrow as pa
 
 
-def create_series():
+def create_series() -> "Series":
     return Series("a", [1, 2])
+
+
+def test_to_frame():
+    assert create_series().to_frame().shape == (2, 1)
 
 
 def test_bitwise_ops():
@@ -88,7 +92,7 @@ def test_various():
     a.sort(in_place=True)
     assert a.series_equal(Series("", [1, 2, 4]))
     a = Series("a", [2, 1, 1, 4, 4, 4])
-    assert list(a.arg_unique()) == [0, 1, 3]
+    assert a.arg_unique().to_list() == [0, 1, 3]
 
     assert a.take([2, 3]).series_equal(Series("", [1, 4]))
     assert a.is_numeric()
@@ -148,6 +152,10 @@ def test_arrow():
     a = Series("a", [1, 2, 3, None])
     out = a.to_arrow()
     assert out == pa.array([1, 2, 3, None])
+
+    a = pa.array(["foo", "bar"], pa.dictionary(pa.int32(), pa.utf8()))
+    s = pl.Series("a", a)
+    assert s.dtype == pl.Utf8
 
 
 def test_view():
@@ -242,3 +250,90 @@ def test_repeat():
     s = pl.repeat("foo", 10)
     assert s.dtype == pl.Utf8
     assert s.len() == 10
+
+
+def test_median():
+    s = Series([1, 2, 3])
+    assert s.median() == 2
+
+
+def test_quantile():
+    s = Series([1, 2, 3])
+    assert s.quantile(0.5) == 2
+
+
+def test_shape():
+    s = Series([1, 2, 3])
+    assert s.shape == (3,)
+
+
+def test_create_list_series():
+    pass
+    # may Segfault: see https://github.com/ritchie46/polars/issues/518
+    # a = [[1, 2], None, [None, 3]]
+    # s = pl.Series("", a)
+    # assert s.to_list() == a
+
+
+def test_iter():
+    s = pl.Series("", [1, 2, 3])
+
+    iter = s.__iter__()
+    assert iter.__next__() == 1
+    assert iter.__next__() == 2
+    assert iter.__next__() == 3
+    assert sum(s) == 6
+
+
+def test_describe():
+    num_s = pl.Series([1, 2, 3])
+    float_s = pl.Series([1.3, 4.6, 8.9])
+    str_s = pl.Series(["abc", "pqr", "xyz"])
+    bool_s = pl.Series([True, False, True, True])
+    empty_s = pl.Series(np.empty(0))
+
+    assert num_s.describe() == {
+        "min": 1,
+        "max": 3,
+        "sum": 6,
+        "mean": 2.0,
+        "std": 1.0,
+        "count": 3,
+    }
+    assert float_s.describe() == {
+        "min": 1.3,
+        "max": 8.9,
+        "sum": 14.8,
+        "mean": 4.933333333333334,
+        "std": 3.8109491381194442,
+        "count": 3,
+    }
+    assert str_s.describe() == {"unique": 3, "count": 3}
+    assert bool_s.describe() == {"sum": 3, "count": 4}
+
+    with pytest.raises(ValueError):
+        assert empty_s.describe()
+
+
+def test_is_in():
+    s = pl.Series([1, 2, 3])
+
+    out = s.is_in([1, 2])
+    assert out == [True, True, False]
+    df = pl.DataFrame({"a": [1.0, 2.0], "b": [1, 4]})
+
+    assert df[pl.col("a").is_in(pl.col("b")).alias("mask")]["mask"] == [True, False]
+
+
+def test_str_slice():
+    df = pl.DataFrame({"a": ["foobar", "barfoo"]})
+    assert df["a"].str_slice(-3) == ["bar", "foo"]
+
+    assert df[[pl.col("a").str_slice(2, 4)]]["a"] == ["obar", "rfoo"]
+
+
+def test_arange_expr():
+    df = pl.DataFrame({"a": ["foobar", "barfoo"]})
+    out = df[[pl.arange(0, pl.col("a").count() * 10)]]
+    assert out.shape == (20, 1)
+    assert out[0][-1] == 19

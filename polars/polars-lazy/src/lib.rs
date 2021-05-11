@@ -90,26 +90,17 @@
 //!
 //!```rust
 //! use polars_core::prelude::*;
+//! use polars_core::df;
 //! use polars_lazy::prelude::*;
 //!
-//! let s0 = Date32Chunked::parse_from_str_slice(
-//!     "date",
-//!     &[
-//!         "2020-08-21",
-//!         "2020-08-21",
-//!         "2020-08-22",
-//!         "2020-08-23",
-//!         "2020-08-22",
-//!     ],
-//!     "%Y-%m-%d",
-//! )
-//! .into_series();
-//! let s1 = Series::new("temp", &[20, 10, 7, 9, 1]);
-//! let s2 = Series::new("rain", &[0.2, 0.1, 0.3, 0.1, 0.01]);
-//! let df = DataFrame::new(vec![s0, s1, s2]).unwrap();
+//! fn example() -> Result<DataFrame> {
+//!     let df = df!(
+//!     "date" => ["2020-08-21", "2020-08-21", "2020-08-22", "2020-08-23", "2020-08-22"],
+//!     "temp" => [20, 10, 7, 9, 1],
+//!     "rain" => [0.2, 0.1, 0.3, 0.1, 0.01]
+//!     )?;
 //!
-//! let new = df
-//!     .lazy()
+//!     df.lazy()
 //!     .groupby(vec![col("date")])
 //!     .agg(vec![
 //!         col("rain").min(),
@@ -118,14 +109,15 @@
 //!     ])
 //!     .sort("date", false)
 //!     .collect()
-//!     .unwrap();
+//!
+//! }
 //! ```
 //!
 //! #### Calling any function
 //!
 //! Below we lazily call a custom closure of type `Series => Result<Series>`. Because the closure
 //! changes the type/variant of the Series we also define the return type. This is important because
-//! due to the lazyness the types should be known beforehand. Note that by applying these custom
+//! due to the laziness the types should be known beforehand. Note that by applying these custom
 //! functions you have access the the whole **eager API** of the Series/ChunkedArrays.
 //!
 //!```rust
@@ -192,11 +184,14 @@
 //!      )
 //! }
 //! ```
-#[cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#[cfg(feature = "datafusion")]
+mod datafusion;
 pub mod dsl;
+mod dummies;
 pub mod frame;
 pub mod functions;
-mod logical_plan;
+pub mod logical_plan;
 pub mod physical_plan;
 pub mod prelude;
 pub(crate) mod utils;

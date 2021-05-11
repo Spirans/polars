@@ -1,10 +1,10 @@
 use crate::logical_plan::optimizer::ALogicalPlanBuilder;
 use crate::logical_plan::{optimizer, Context};
 use crate::prelude::*;
+use crate::utils::rename_aexpr_root_name;
 use crate::utils::{
-    aexpr_to_root_column_name, aexpr_to_root_names, aexprs_to_schema, check_down_node,
+    aexpr_to_root_column_name, aexpr_to_root_names, aexprs_to_schema, check_down_node, has_aexpr,
 };
-use crate::utils::{has_aexpr, rename_aexpr_root_name};
 use ahash::RandomState;
 use polars_core::prelude::*;
 use std::collections::HashMap;
@@ -91,6 +91,17 @@ fn roots_to_key(roots: &[Arc<String>]) -> Arc<String> {
     }
 }
 
+fn get_insertion_name(expr_arena: &Arena<AExpr>, predicate: Node, schema: &Schema) -> Arc<String> {
+    Arc::new(
+        expr_arena
+            .get(predicate)
+            .to_field(schema, Context::Default, expr_arena)
+            .unwrap()
+            .name()
+            .clone(),
+    )
+}
+
 pub(crate) struct PredicatePushDown {}
 
 impl Default for PredicatePushDown {
@@ -99,42 +110,54 @@ impl Default for PredicatePushDown {
     }
 }
 
-fn no_pushdown_preds(
+fn no_pushdown_preds<F>(
     // node that is projected | hstacked
     node: Node,
     arena: &Arena<AExpr>,
-    matches: &[AExpr],
+    matches: F,
     // predicates that will be filtered at this node in the LP
     local_predicates: &mut Vec<Node>,
     acc_predicates: &mut HashMap<Arc<String>, Node, RandomState>,
-) {
+) where
+    F: Fn(&AExpr) -> bool,
+{
     // matching expr are typically explode, shift, etc. expressions that mess up predicates when pushed down
-    for matching_expr in matches {
-        if has_aexpr(node, &arena, matching_expr) {
-            // columns that are projected. We check if we can push down the predicates past this projection
-            let columns = aexpr_to_root_names(node, &arena);
-            debug_assert_eq!(columns.len(), 1);
+    if has_aexpr(node, &arena, matches) {
+        // columns that are projected. We check if we can push down the predicates past this projection
+        let columns = aexpr_to_root_names(node, &arena);
 
-            // keep track of the predicates that should be removed from pushed down predicates
-            // these predicates will be added to local predicates
-            let mut remove_keys = Vec::with_capacity(acc_predicates.len());
+        let condition = |name: Arc<String>| columns.contains(&name);
+        local_predicates.extend(transfer_to_local(arena, acc_predicates, condition));
+    }
+}
 
-            for (key, predicate) in &*acc_predicates {
-                let root_names = aexpr_to_root_names(*predicate, arena);
+/// Transfer a predicate from `acc_predicates` that will be pushed down
+/// to a local_predicates vec based on a condition.
+fn transfer_to_local<F>(
+    expr_arena: &Arena<AExpr>,
+    acc_predicates: &mut HashMap<Arc<String>, Node, RandomState>,
+    mut condition: F,
+) -> Vec<Node>
+where
+    F: FnMut(Arc<String>) -> bool,
+{
+    let mut remove_keys = Vec::with_capacity(acc_predicates.len());
 
-                for name in root_names {
-                    if columns.contains(&name) {
-                        remove_keys.push(key.clone());
-                        continue;
-                    }
-                }
-            }
-            for key in remove_keys {
-                let pred = acc_predicates.remove(&*key).expect("we know it exists");
-                local_predicates.push(pred);
+    for (key, predicate) in &*acc_predicates {
+        let root_names = aexpr_to_root_names(*predicate, expr_arena);
+        for name in root_names {
+            if condition(name) {
+                remove_keys.push(key.clone());
+                continue;
             }
         }
     }
+    let mut local_predicates = Vec::with_capacity(remove_keys.len());
+    for key in remove_keys {
+        let pred = acc_predicates.remove(&*key).unwrap();
+        local_predicates.push(pred)
+    }
+    local_predicates
 }
 
 impl PredicatePushDown {
@@ -206,10 +229,6 @@ impl PredicatePushDown {
         use ALogicalPlan::*;
 
         match logical_plan {
-            Slice { input, offset, len } => {
-                self.pushdown_and_assign(input, acc_predicates, lp_arena, expr_arena)?;
-                Ok(Slice { input, offset, len })
-            }
             Selection { predicate, input } => {
                 let name = roots_to_key(&aexpr_to_root_names(predicate, expr_arena));
                 insert_and_combine_predicate(&mut acc_predicates, name, predicate, expr_arena);
@@ -247,11 +266,14 @@ impl PredicatePushDown {
                     }
 
                     // remove predicates that are based on an exploded column
-                    // todo! add shift
                     no_pushdown_preds(
                         *node,
                         &expr_arena,
-                        &[AExpr::Explode(Default::default())],
+                        |e| {
+                            matches!(e, AExpr::Explode(_))
+                                || matches!(e, AExpr::Shift { .. })
+                                || matches!(e, AExpr::Sort { .. })
+                        },
                         &mut local_predicates,
                         &mut acc_predicates,
                     );
@@ -288,24 +310,12 @@ impl PredicatePushDown {
                 schema,
             } => {
                 // predicates that will be done at this level
-                let mut remove_keys = Vec::with_capacity(acc_predicates.len());
-
-                for (key, predicate) in &acc_predicates {
-                    let root_names = aexpr_to_root_names(*predicate, expr_arena);
-                    for name in root_names {
-                        if (&*name == "variable")
-                            || (&*name == "value")
-                            || value_vars.contains(&*name)
-                        {
-                            remove_keys.push(key.clone());
-                        }
-                    }
-                }
-                let mut local_predicates = Vec::with_capacity(remove_keys.len());
-                for key in remove_keys {
-                    let pred = acc_predicates.remove(&*key).unwrap();
-                    local_predicates.push(pred)
-                }
+                let condition = |name: Arc<String>| {
+                    let name = &*name;
+                    name == "variable" || name == "value" || value_vars.contains(name)
+                };
+                let local_predicates =
+                    transfer_to_local(expr_arena, &mut acc_predicates, condition);
 
                 self.pushdown_and_assign(input, acc_predicates, lp_arena, expr_arena)?;
 
@@ -327,7 +337,7 @@ impl PredicatePushDown {
                     .filter(|e| check_down_node(*e, schema, expr_arena))
                     .collect();
 
-                let schema = aexprs_to_schema(&expr, schema, Context::Other, expr_arena);
+                let schema = aexprs_to_schema(&expr, schema, Context::Default, expr_arena);
                 Ok(ALogicalPlan::LocalProjection {
                     expr,
                     input,
@@ -369,6 +379,7 @@ impl PredicatePushDown {
                 predicate,
                 aggregate,
                 cache,
+                low_memory,
             } => {
                 let predicate = predicate_at_scan(acc_predicates, predicate, expr_arena);
 
@@ -384,47 +395,18 @@ impl PredicatePushDown {
                     predicate,
                     aggregate,
                     cache,
+                    low_memory,
                 };
                 Ok(lp)
             }
-            Sort {
-                input,
-                by_column,
-                reverse,
-            } => {
-                self.pushdown_and_assign(input, acc_predicates, lp_arena, expr_arena)?;
-                Ok(Sort {
-                    input,
-                    by_column,
-                    reverse,
-                })
-            }
             Explode { input, columns } => {
-                // we remove predicates that are done in one of the exploded columns.
-                let mut remove_keys = Vec::with_capacity(acc_predicates.len());
-
-                for (key, predicate) in &acc_predicates {
-                    let root_names = aexpr_to_root_names(*predicate, expr_arena);
-                    for name in root_names {
-                        if columns.contains(&*name) {
-                            remove_keys.push(key.clone());
-                            continue;
-                        }
-                    }
-                }
-                let mut local_predicates = Vec::with_capacity(remove_keys.len());
-                for key in remove_keys {
-                    let pred = acc_predicates.remove(&*key).unwrap();
-                    local_predicates.push(pred)
-                }
+                let condition = |name: Arc<String>| columns.contains(&*name);
+                let local_predicates =
+                    transfer_to_local(expr_arena, &mut acc_predicates, condition);
 
                 self.pushdown_and_assign(input, acc_predicates, lp_arena, expr_arena)?;
                 let lp = Explode { input, columns };
                 Ok(self.apply_predicate(lp, local_predicates, lp_arena, expr_arena))
-            }
-            Cache { input } => {
-                self.pushdown_and_assign(input, acc_predicates, lp_arena, expr_arena)?;
-                Ok(Cache { input })
             }
             Distinct {
                 input,
@@ -435,26 +417,22 @@ impl PredicatePushDown {
                 // this may have influence on the pushed down predicates. If the pushed down predicates
                 // contain a binary expression (thus depending on values in multiple columns)
                 // the final result may differ if it is pushed down.
-                let mut local_predicates = Vec::with_capacity(acc_predicates.len());
-                let mut new_acc_predicates = optimizer::init_hashmap();
 
-                for (name, predicate) in acc_predicates {
-                    if has_aexpr(
-                        predicate,
-                        expr_arena,
-                        &AExpr::BinaryExpr {
-                            left: Default::default(),
-                            op: Operator::And,
-                            right: Default::default(),
-                        },
-                    ) {
-                        local_predicates.push(predicate)
+                let mut root_count = 0;
+
+                // if this condition is called more than once, its a binary or ternary operation.
+                let condition = |_| {
+                    if root_count == 0 {
+                        root_count += 1;
+                        false
                     } else {
-                        new_acc_predicates.insert(name, predicate);
+                        true
                     }
-                }
+                };
+                let local_predicates =
+                    transfer_to_local(expr_arena, &mut acc_predicates, condition);
 
-                self.pushdown_and_assign(input, new_acc_predicates, lp_arena, expr_arena)?;
+                self.pushdown_and_assign(input, acc_predicates, lp_arena, expr_arena)?;
                 let lp = Distinct {
                     input,
                     maintain_order,
@@ -500,15 +478,9 @@ impl PredicatePushDown {
 
                 for (_, predicate) in acc_predicates {
                     // unique and duplicated can be caused by joins
-                    if has_aexpr(predicate, expr_arena, &AExpr::Unique(Default::default())) {
-                        local_predicates.push(predicate);
-                        continue;
-                    }
-                    if has_aexpr(
-                        predicate,
-                        expr_arena,
-                        &AExpr::Duplicated(Default::default()),
-                    ) {
+                    let matches =
+                        |e: &AExpr| matches!(e, AExpr::IsUnique(_) | AExpr::Duplicated(_));
+                    if has_aexpr(predicate, expr_arena, matches) {
                         local_predicates.push(predicate);
                         continue;
                     }
@@ -517,14 +489,7 @@ impl PredicatePushDown {
 
                     // no else if. predicate can be in both tables.
                     if check_down_node(predicate, schema_left, expr_arena) {
-                        let name = Arc::new(
-                            expr_arena
-                                .get(predicate)
-                                .to_field(schema_left, Context::Other, expr_arena)
-                                .unwrap()
-                                .name()
-                                .clone(),
-                        );
+                        let name = get_insertion_name(expr_arena, predicate, schema_left);
                         insert_and_combine_predicate(
                             &mut pushdown_left,
                             name,
@@ -534,14 +499,7 @@ impl PredicatePushDown {
                         filter_left = true;
                     }
                     if check_down_node(predicate, schema_right, expr_arena) {
-                        let name = Arc::new(
-                            expr_arena
-                                .get(predicate)
-                                .to_field(schema_right, Context::Other, expr_arena)
-                                .unwrap()
-                                .name()
-                                .clone(),
-                        );
+                        let name = get_insertion_name(expr_arena, predicate, schema_right);
                         insert_and_combine_predicate(
                             &mut pushdown_right,
                             name,
@@ -556,15 +514,12 @@ impl PredicatePushDown {
                     }
                     // An outer join or left join may create null values.
                     // we also do it local
-                    if (how == JoinType::Outer) | (how == JoinType::Left) {
-                        if has_aexpr(predicate, expr_arena, &AExpr::IsNotNull(Default::default())) {
-                            local_predicates.push(predicate);
-                            continue;
-                        }
-                        if has_aexpr(predicate, expr_arena, &AExpr::IsNull(Default::default())) {
-                            local_predicates.push(predicate);
-                            continue;
-                        }
+                    let matches = |e: &AExpr| matches!(e, AExpr::IsNotNull(_) | AExpr::IsNull(_));
+                    if (how == JoinType::Outer) | (how == JoinType::Left)
+                        && has_aexpr(predicate, expr_arena, matches)
+                    {
+                        local_predicates.push(predicate);
+                        continue;
                     }
                 }
 
@@ -584,44 +539,16 @@ impl PredicatePushDown {
                 Ok(self.apply_predicate(lp, local_predicates, lp_arena, expr_arena))
             }
             HStack { input, exprs, .. } => {
-                // local predicates will be executed in this node of the LP
-                let len = acc_predicates.len();
-                let mut local_predicates = Vec::with_capacity(len);
-                let mut local_keys = Vec::with_capacity(len);
-
-                for (key, predicate) in &acc_predicates {
-                    if !check_down_node(
-                        *predicate,
-                        lp_arena.get(input).schema(lp_arena),
-                        expr_arena,
-                    ) {
-                        local_keys.push(key.clone());
-                    }
-                }
-
                 // First we get all names of added columns in this HStack operation
-                // and then we remove the predicates from the elegible container if they are
+                // and then we remove the predicates from the eligible container if they are
                 // dependent on data we've added in this node.
 
                 // *use a vec instead of a set because of the low number of expected columns
                 let mut added_cols = Vec::with_capacity(exprs.len());
                 for e in &exprs {
                     // shifts | sorts are influenced by a filter so we do all predicates before the shift | sort
-                    if has_aexpr(
-                        *e,
-                        expr_arena,
-                        &AExpr::Shift {
-                            input: Default::default(),
-                            periods: Default::default(),
-                        },
-                    ) || has_aexpr(
-                        *e,
-                        expr_arena,
-                        &AExpr::Sort {
-                            expr: Default::default(),
-                            reverse: Default::default(),
-                        },
-                    ) {
+                    let matches = |e: &AExpr| matches!(e, AExpr::Shift { .. } | AExpr::Sort { .. });
+                    if has_aexpr(*e, expr_arena, matches) {
                         let lp = ALogicalPlanBuilder::new(input, expr_arena, lp_arena)
                             .with_columns(exprs)
                             .build();
@@ -639,18 +566,18 @@ impl PredicatePushDown {
                         added_cols.push(name);
                     }
                 }
-                // remove predicates that are dependent on columns added in this HStack.
-                for key in acc_predicates.keys() {
-                    if added_cols.contains(key) {
-                        local_keys.push(key.clone())
-                    }
-                }
 
-                for key in local_keys {
-                    if let Some(val) = acc_predicates.remove(&key) {
-                        local_predicates.push(val);
-                    }
-                }
+                let condition = |name: Arc<String>| {
+                    // remove predicates that are dependent on columns added in this HStack.
+                    added_cols.contains(&name)
+                        || lp_arena
+                            .get(input)
+                            .schema(lp_arena)
+                            .field_with_name(&*name)
+                            .is_err()
+                };
+                let local_predicates =
+                    transfer_to_local(expr_arena, &mut acc_predicates, condition);
 
                 self.pushdown_and_assign(input, acc_predicates, lp_arena, expr_arena)?;
                 let lp = ALogicalPlanBuilder::new(input, expr_arena, lp_arena)
@@ -673,14 +600,7 @@ impl PredicatePushDown {
                     let mut local_predicates = Vec::with_capacity(acc_predicates.len());
                     for (_, predicate) in acc_predicates {
                         if check_down_node(predicate, input_schema, expr_arena) {
-                            let name = Arc::new(
-                                expr_arena
-                                    .get(predicate)
-                                    .to_field(input_schema, Context::Other, expr_arena)
-                                    .unwrap()
-                                    .name()
-                                    .clone(),
-                            );
+                            let name = get_insertion_name(expr_arena, predicate, input_schema);
                             insert_and_combine_predicate(
                                 &mut pushdown_predicates,
                                 name,
@@ -709,6 +629,31 @@ impl PredicatePushDown {
                     projection_pd,
                     schema,
                 })
+            }
+            lp => {
+                let inputs = lp.get_inputs();
+                let exprs = lp.get_exprs();
+
+                let new_inputs = if inputs.len() == 1 {
+                    let node = inputs[0];
+                    let alp = lp_arena.take(node);
+                    let alp = self.push_down(alp, acc_predicates, lp_arena, expr_arena)?;
+                    lp_arena.replace(node, alp);
+                    vec![node]
+                } else {
+                    inputs
+                        .iter()
+                        .map(|&node| {
+                            let alp = lp_arena.take(node);
+                            let alp =
+                                self.push_down(alp, acc_predicates.clone(), lp_arena, expr_arena)?;
+                            lp_arena.replace(node, alp);
+                            Ok(node)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+
+                Ok(lp.from_exprs_and_input(exprs, new_inputs))
             }
         }
     }

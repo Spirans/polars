@@ -98,7 +98,6 @@ impl BooleanBufferBuilder {
 
     #[inline]
     pub fn finish(&mut self) -> Buffer {
-        self.shrink_to_fit();
         let buf = std::mem::replace(&mut self.buffer, MutableBuffer::new(0));
         self.len = 0;
         buf.into()
@@ -385,7 +384,7 @@ impl NoNullLargeStringBuilder {
         assert_eq!(buf_values.len(), buf_values.capacity());
         assert_eq!(buf_offsets.len(), buf_offsets.capacity());
 
-        // note that the arrays are already shrinked when transformed to an arrow buffer.
+        // note that the arrays are already shrunk when transformed to an arrow buffer.
         let arraydata = ArrayData::builder(DataType::LargeUtf8)
             .len(offsets_len)
             .add_buffer(buf_offsets)
@@ -415,9 +414,9 @@ mod test {
     #[test]
     fn test_string_builder() {
         let mut builder = LargeStringBuilder::with_capacity(1, 3);
-        builder.append_value("foo");
-        builder.append_null();
-        builder.append_value("bar");
+        builder.append_value("foo").unwrap();
+        builder.append_null().unwrap();
+        builder.append_value("bar").unwrap();
         let out = builder.finish();
         let vals = out.iter().collect::<Vec<_>>();
         assert_eq!(vals, &[Some("foo"), None, Some("bar")]);

@@ -21,9 +21,8 @@ where
         operator: impl Fn(&PrimitiveArray<T>, &PrimitiveArray<T>) -> arrow::error::Result<BooleanArray>,
     ) -> Result<BooleanChunked> {
         let chunks = self
-            .downcast_chunks()
-            .iter()
-            .zip(rhs.downcast_chunks())
+            .downcast_iter()
+            .zip(rhs.downcast_iter())
             .map(|(left, right)| {
                 let arr_res = operator(left, right);
                 let arr = match arr_res {
@@ -74,7 +73,7 @@ where
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             // should not fail if arrays are equal
             self.comparison(rhs, comparison::eq)
                 .expect("should not fail.")
@@ -93,7 +92,7 @@ where
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, comparison::neq)
                 .expect("should not fail.")
         } else {
@@ -111,7 +110,7 @@ where
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, comparison::gt)
                 .expect("should not fail.")
         } else {
@@ -129,7 +128,7 @@ where
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, comparison::gt_eq)
                 .expect("should not fail.")
         } else {
@@ -147,7 +146,7 @@ where
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, comparison::lt)
                 .expect("should not fail.")
         } else {
@@ -165,7 +164,7 @@ where
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, comparison::lt_eq)
                 .expect("should not fail.")
         } else {
@@ -323,7 +322,7 @@ impl ChunkCompare<&Utf8Chunked> for Utf8Chunked {
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, eq_utf8).expect("should not fail")
         } else {
             apply_operand_on_chunkedarray_by_iter!(self, rhs, ==)
@@ -340,7 +339,7 @@ impl ChunkCompare<&Utf8Chunked> for Utf8Chunked {
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, neq_utf8).expect("should not fail")
         } else {
             apply_operand_on_chunkedarray_by_iter!(self, rhs, !=)
@@ -357,7 +356,7 @@ impl ChunkCompare<&Utf8Chunked> for Utf8Chunked {
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, gt_utf8).expect("should not fail")
         } else {
             apply_operand_on_chunkedarray_by_iter!(self, rhs, >)
@@ -374,7 +373,7 @@ impl ChunkCompare<&Utf8Chunked> for Utf8Chunked {
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, gt_eq_utf8).expect("should not fail")
         } else {
             apply_operand_on_chunkedarray_by_iter!(self, rhs, >=)
@@ -391,7 +390,7 @@ impl ChunkCompare<&Utf8Chunked> for Utf8Chunked {
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, lt_utf8).expect("should not fail")
         } else {
             apply_operand_on_chunkedarray_by_iter!(self, rhs, <)
@@ -408,7 +407,7 @@ impl ChunkCompare<&Utf8Chunked> for Utf8Chunked {
             }
         }
         // same length
-        else if self.chunk_id == rhs.chunk_id {
+        else if self.chunk_id().zip(rhs.chunk_id()).all(|(l, r)| l == r) {
             self.comparison(rhs, lt_eq_utf8).expect("should not fail")
         } else {
             apply_operand_on_chunkedarray_by_iter!(self, rhs, <=)
@@ -571,9 +570,8 @@ impl BooleanChunked {
         operator: impl Fn(&BooleanArray, &BooleanArray) -> arrow::error::Result<BooleanArray>,
     ) -> Result<BooleanChunked> {
         let chunks = self
-            .downcast_chunks()
-            .iter()
-            .zip(rhs.downcast_chunks())
+            .downcast_iter()
+            .zip(rhs.downcast_iter())
             .map(|(left, right)| {
                 let arr_res = operator(left, right);
                 let arr = match arr_res {
@@ -590,7 +588,7 @@ impl BooleanChunked {
 
 macro_rules! impl_bitwise_op  {
     ($self:ident, $rhs:ident, $arrow_method:ident, $op:tt) => {{
-        if $self.chunk_id == $rhs.chunk_id {
+        if $self.chunk_id().zip($rhs.chunk_id()).all(|(l, r)| l == r) {
             let result = $self.bit_operation($rhs, compute::$arrow_method);
             result.unwrap()
         } else {
@@ -645,8 +643,7 @@ impl Not for &BooleanChunked {
 
     fn not(self) -> Self::Output {
         let chunks = self
-            .downcast_chunks()
-            .iter()
+            .downcast_iter()
             .map(|a| {
                 let arr = compute::not(a).expect("should not fail");
                 Arc::new(arr) as ArrayRef
@@ -664,67 +661,8 @@ impl Not for BooleanChunked {
     }
 }
 
-pub trait CompToSeries {
-    fn lt_series(&self, _rhs: &Series) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn gt_series(&self, _rhs: &Series) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn gt_eq_series(&self, _rhs: &Series) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn lt_eq_series(&self, _rhs: &Series) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn eq_series(&self, _rhs: &Series) -> BooleanChunked {
-        unimplemented!()
-    }
-
-    fn neq_series(&self, _rhs: &Series) -> BooleanChunked {
-        unimplemented!()
-    }
-}
-
-impl<T> CompToSeries for ChunkedArray<T>
-where
-    T: PolarsSingleType,
-    ChunkedArray<T>: IntoSeries,
-{
-    fn lt_series(&self, rhs: &Series) -> BooleanChunked {
-        ChunkCompare::<&Series>::lt(&self.clone().into_series(), rhs)
-    }
-
-    fn gt_series(&self, rhs: &Series) -> BooleanChunked {
-        ChunkCompare::<&Series>::gt(&self.clone().into_series(), rhs)
-    }
-
-    fn gt_eq_series(&self, rhs: &Series) -> BooleanChunked {
-        ChunkCompare::<&Series>::gt_eq(&self.clone().into_series(), rhs)
-    }
-
-    fn lt_eq_series(&self, rhs: &Series) -> BooleanChunked {
-        ChunkCompare::<&Series>::lt_eq(&self.clone().into_series(), rhs)
-    }
-
-    fn eq_series(&self, rhs: &Series) -> BooleanChunked {
-        ChunkCompare::<&Series>::eq(&self.clone().into_series(), rhs)
-    }
-
-    fn neq_series(&self, rhs: &Series) -> BooleanChunked {
-        ChunkCompare::<&Series>::neq(&self.clone().into_series(), rhs)
-    }
-}
-
-impl CompToSeries for ListChunked {}
-#[cfg(feature = "object")]
-impl<T> CompToSeries for ObjectChunked<T> {}
-
 impl BooleanChunked {
+    /// Check if all values are true
     pub fn all_true(&self) -> bool {
         match self.sum() {
             None => false,
@@ -734,11 +672,66 @@ impl BooleanChunked {
 }
 
 impl BooleanChunked {
+    /// Check if all values are false
     pub fn all_false(&self) -> bool {
         match self.sum() {
             None => false,
             Some(n) => (n as usize) == 0,
         }
+    }
+}
+
+// private
+pub(crate) trait ChunkEqualElement {
+    /// Check if element in self is equal to element in other, assumes same dtypes
+    ///
+    /// # Safety
+    ///
+    /// No type checks.
+    unsafe fn equal_element(&self, _idx_self: usize, _idx_other: usize, _other: &Series) -> bool {
+        unimplemented!()
+    }
+}
+
+impl<T> ChunkEqualElement for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+    T::Native: PartialEq,
+{
+    unsafe fn equal_element(&self, idx_self: usize, idx_other: usize, other: &Series) -> bool {
+        let ca_other = other.as_ref().as_ref();
+        debug_assert!(self.dtype() == other.dtype());
+        let ca_other = &*(ca_other as *const ChunkedArray<T>);
+        // Should be get and not get_unchecked, because there could be nulls
+        self.get(idx_self) == ca_other.get(idx_other)
+    }
+}
+
+impl ChunkEqualElement for BooleanChunked {
+    unsafe fn equal_element(&self, idx_self: usize, idx_other: usize, other: &Series) -> bool {
+        let ca_other = other.as_ref().as_ref();
+        debug_assert!(self.dtype() == other.dtype());
+        let ca_other = &*(ca_other as *const BooleanChunked);
+        self.get(idx_self) == ca_other.get(idx_other)
+    }
+}
+
+impl ChunkEqualElement for Utf8Chunked {
+    unsafe fn equal_element(&self, idx_self: usize, idx_other: usize, other: &Series) -> bool {
+        let ca_other = other.as_ref().as_ref();
+        debug_assert!(self.dtype() == other.dtype());
+        let ca_other = &*(ca_other as *const Utf8Chunked);
+        self.get(idx_self) == ca_other.get(idx_other)
+    }
+}
+
+impl ChunkEqualElement for ListChunked {}
+impl ChunkEqualElement for CategoricalChunked {
+    unsafe fn equal_element(&self, idx_self: usize, idx_other: usize, other: &Series) -> bool {
+        let ca_other = other.as_ref().as_ref();
+        debug_assert!(self.dtype() == other.dtype());
+        let ca_other = &*(ca_other as *const CategoricalChunked);
+        self.get(idx_self) == ca_other.get(idx_other)
     }
 }
 
@@ -936,7 +929,7 @@ mod test {
         // This failed with arrow comparisons.
         // sliced
         let a1: Int32Chunked = (&[Some(1), Some(2)]).iter().copied().collect();
-        let a1 = a1.slice(1, 1).unwrap();
+        let a1 = a1.slice(1, 1);
         let a2: Int32Chunked = (&[Some(2)]).iter().copied().collect();
         assert_eq!(a1.eq(&a2).sum(), a2.eq(&a1).sum());
         assert_eq!(a1.neq(&a2).sum(), a2.neq(&a1).sum());
@@ -946,7 +939,7 @@ mod test {
         assert_eq!(a1.gt_eq(&a2).sum(), a2.gt_eq(&a1).sum());
 
         let a1: Utf8Chunked = (&["a", "b"]).iter().copied().collect();
-        let a1 = a1.slice(1, 1).unwrap();
+        let a1 = a1.slice(1, 1);
         let a2: Utf8Chunked = (&["b"]).iter().copied().collect();
         assert_eq!(a1.eq(&a2).sum(), a2.eq(&a1).sum());
         assert_eq!(a1.neq(&a2).sum(), a2.neq(&a1).sum());

@@ -7,9 +7,9 @@ mod comparison;
 pub mod implementations;
 pub(crate) mod iterator;
 
-use crate::chunked_array::builder::get_list_builder;
-use crate::chunked_array::float::IsNan;
-use arrow::array::ArrayDataRef;
+use crate::chunked_array::{builder::get_list_builder, float::IsNan, ChunkIdIter};
+use crate::series::arithmetic::coerce_lhs_rhs;
+use arrow::array::ArrayData;
 use arrow::compute::cast;
 use itertools::Itertools;
 use num::NumCast;
@@ -26,11 +26,22 @@ pub trait IntoSeries {
 
 pub(crate) mod private {
     use super::*;
-    use crate::frame::group_by::{GroupTuples, PivotAgg};
+    #[cfg(feature = "pivot")]
+    use crate::frame::groupby::pivot::PivotAgg;
+    use crate::frame::groupby::GroupTuples;
+
     use ahash::RandomState;
 
     pub trait PrivateSeries {
-        fn vec_hash(&self, _random_state: RandomState) -> UInt64Chunked {
+        unsafe fn equal_element(
+            &self,
+            _idx_self: usize,
+            _idx_other: usize,
+            _other: &Series,
+        ) -> bool {
+            unimplemented!()
+        }
+        fn vec_hash(&self, _build_hasher: RandomState) -> UInt64Chunked {
             unimplemented!()
         }
         fn agg_mean(&self, _groups: &[(u32, Vec<u32>)]) -> Option<Series> {
@@ -69,6 +80,7 @@ pub(crate) mod private {
         fn agg_median(&self, _groups: &[(u32, Vec<u32>)]) -> Option<Series> {
             unimplemented!()
         }
+        #[cfg(feature = "pivot")]
         fn pivot<'a>(
             &self,
             _pivot_series: &'a (dyn SeriesTrait + 'a),
@@ -79,6 +91,7 @@ pub(crate) mod private {
             unimplemented!()
         }
 
+        #[cfg(feature = "pivot")]
         fn pivot_count<'a>(
             &self,
             _pivot_series: &'a (dyn SeriesTrait + 'a),
@@ -123,6 +136,15 @@ pub(crate) mod private {
         fn group_tuples(&self, _multithreaded: bool) -> GroupTuples {
             unimplemented!()
         }
+        fn zip_with_same_type(&self, _mask: &BooleanChunked, _other: &Series) -> Result<Series> {
+            unimplemented!()
+        }
+        #[cfg(feature = "sort_multiple")]
+        fn argsort_multiple(&self, _by: &[Series], _reverse: &[bool]) -> Result<UInt32Chunked> {
+            Err(PolarsError::InvalidOperation(
+                "argsort_multiple is not implemented for this Series".into(),
+            ))
+        }
     }
 }
 
@@ -146,12 +168,12 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     fn rename(&mut self, name: &str);
 
     /// Get Arrow ArrayData
-    fn array_data(&self) -> Vec<ArrayDataRef> {
+    fn array_data(&self) -> Vec<&ArrayData> {
         unimplemented!()
     }
 
     /// Get the lengths of the underlying chunks
-    fn chunk_lengths(&self) -> &Vec<usize> {
+    fn chunk_lengths(&self) -> ChunkIdIter {
         unimplemented!()
     }
     /// Name of series.
@@ -331,12 +353,15 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     }
 
     /// Take `num_elements` from the top as a zero copy view.
-    fn limit(&self, num_elements: usize) -> Result<Series> {
+    fn limit(&self, num_elements: usize) -> Series {
         self.slice(0, num_elements)
     }
 
     /// Get a zero copy view of the data.
-    fn slice(&self, _offset: usize, _length: usize) -> Result<Series> {
+    ///
+    /// When offset is negative the offset is counted from the
+    /// end of the array
+    fn slice(&self, _offset: i64, _length: usize) -> Series {
         unimplemented!()
     }
 
@@ -443,6 +468,18 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
         }
     }
 
+    /// Returns the mean value in the array
+    /// Returns an option because the array is nullable.
+    fn mean(&self) -> Option<f64> {
+        unimplemented!()
+    }
+
+    /// Returns the median value in the array
+    /// Returns an option because the array is nullable.
+    fn median(&self) -> Option<f64> {
+        unimplemented!()
+    }
+
     /// Create a new Series filled with values at that index.
     ///
     /// # Example
@@ -457,7 +494,7 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
         unimplemented!()
     }
 
-    fn cast_with_datatype(&self, _data_type: &DataType) -> Result<Series> {
+    fn cast_with_dtype(&self, _data_type: &DataType) -> Result<Series> {
         unimplemented!()
     }
 
@@ -515,7 +552,17 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     }
 
     /// Get first indexes of unique values.
-    fn arg_unique(&self) -> Result<Vec<u32>> {
+    fn arg_unique(&self) -> Result<UInt32Chunked> {
+        unimplemented!()
+    }
+
+    /// Get min index
+    fn arg_min(&self) -> Option<usize> {
+        unimplemented!()
+    }
+
+    /// Get max index
+    fn arg_max(&self) -> Option<usize> {
         unimplemented!()
     }
 
@@ -634,12 +681,6 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
         unimplemented!()
     }
 
-    /// Create a new ChunkedArray with values from self where the mask evaluates `true` and values
-    /// from `other` where the mask evaluates `false`
-    fn zip_with(&self, _mask: &BooleanChunked, _other: &Series) -> Result<Series> {
-        unimplemented!()
-    }
-
     /// Get the sum of the Series as a new Series of length 1.
     fn sum_as_series(&self) -> Series {
         unimplemented!()
@@ -676,9 +717,10 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     /// [ChunkedArray::rolling_mean](crate::prelude::ChunkWindow::rolling_mean).
     fn rolling_mean(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Series> {
         unimplemented!()
     }
@@ -686,9 +728,10 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     /// [ChunkedArray::rolling_mean](crate::prelude::ChunkWindow::rolling_sum).
     fn rolling_sum(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Series> {
         unimplemented!()
     }
@@ -696,9 +739,10 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     /// [ChunkedArray::rolling_mean](crate::prelude::ChunkWindow::rolling_min).
     fn rolling_min(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Series> {
         unimplemented!()
     }
@@ -706,9 +750,10 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     /// [ChunkedArray::rolling_mean](crate::prelude::ChunkWindow::rolling_max).
     fn rolling_max(
         &self,
-        _window_size: usize,
+        _window_size: u32,
         _weight: Option<&[f64]>,
         _ignore_null: bool,
+        _min_periods: u32,
     ) -> Result<Series> {
         unimplemented!()
     }
@@ -721,33 +766,32 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     #[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
     /// Extract hour from underlying NaiveDateTime representation.
     /// Returns the hour number from 0 to 23.
-    fn hour(&self) -> Result<Series> {
-        unimplemented!()
+    fn hour(&self) -> Result<UInt32Chunked> {
+        self.date64().map(|ca| ca.hour())
     }
 
     #[cfg(feature = "temporal")]
     #[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
     /// Extract minute from underlying NaiveDateTime representation.
     /// Returns the minute number from 0 to 59.
-    fn minute(&self) -> Result<Series> {
-        unimplemented!()
+    fn minute(&self) -> Result<UInt32Chunked> {
+        self.date64().map(|ca| ca.minute())
     }
 
     #[cfg(feature = "temporal")]
     #[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
     /// Extract second from underlying NaiveDateTime representation.
     /// Returns the second number from 0 to 59.
-    fn second(&self) -> Result<Series> {
-        unimplemented!()
+    fn second(&self) -> Result<UInt32Chunked> {
+        self.date64().map(|ca| ca.second())
     }
 
     #[cfg(feature = "temporal")]
     #[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
-    /// Extract second from underlying NaiveDateTime representation.
     /// Returns the number of nanoseconds since the whole non-leap second.
     /// The range from 1,000,000,000 to 1,999,999,999 represents the leap second.
-    fn nanosecond(&self) -> Result<Series> {
-        unimplemented!()
+    fn nanosecond(&self) -> Result<UInt32Chunked> {
+        self.date64().map(|ca| ca.nanosecond())
     }
 
     #[cfg(feature = "temporal")]
@@ -756,8 +800,40 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     /// Returns the day of month starting from 1.
     ///
     /// The return value ranges from 1 to 31. (The last day of month differs by months.)
-    fn day(&self) -> Result<Series> {
-        unimplemented!()
+    fn day(&self) -> Result<UInt32Chunked> {
+        match self.dtype() {
+            DataType::Date32 => self.date32().map(|ca| ca.day()),
+            DataType::Date64 => self.date64().map(|ca| ca.day()),
+            _ => Err(PolarsError::InvalidOperation(
+                format!("operation not supported on dtype {:?}", self.dtype()).into(),
+            )),
+        }
+    }
+    #[cfg(feature = "temporal")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
+    /// Returns the weekday number where monday = 0 and sunday = 6
+    fn weekday(&self) -> Result<UInt32Chunked> {
+        match self.dtype() {
+            DataType::Date32 => self.date32().map(|ca| ca.weekday()),
+            DataType::Date64 => self.date64().map(|ca| ca.weekday()),
+            _ => Err(PolarsError::InvalidOperation(
+                format!("operation not supported on dtype {:?}", self.dtype()).into(),
+            )),
+        }
+    }
+
+    #[cfg(feature = "temporal")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
+    /// Returns the ISO week number starting from 1.
+    /// The return value ranges from 1 to 53. (The last week of year differs by years.)
+    fn week(&self) -> Result<UInt32Chunked> {
+        match self.dtype() {
+            DataType::Date32 => self.date32().map(|ca| ca.week()),
+            DataType::Date64 => self.date64().map(|ca| ca.week()),
+            _ => Err(PolarsError::InvalidOperation(
+                format!("operation not supported on dtype {:?}", self.dtype()).into(),
+            )),
+        }
     }
 
     #[cfg(feature = "temporal")]
@@ -765,8 +841,14 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     /// Returns the day of year starting from 1.
     ///
     /// The return value ranges from 1 to 366. (The last day of year differs by years.)
-    fn ordinal_day(&self) -> Result<Series> {
-        unimplemented!()
+    fn ordinal_day(&self) -> Result<UInt32Chunked> {
+        match self.dtype() {
+            DataType::Date32 => self.date32().map(|ca| ca.ordinal()),
+            DataType::Date64 => self.date64().map(|ca| ca.ordinal()),
+            _ => Err(PolarsError::InvalidOperation(
+                format!("operation not supported on dtype {:?}", self.dtype()).into(),
+            )),
+        }
     }
 
     #[cfg(feature = "temporal")]
@@ -775,16 +857,28 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
     /// Returns the month number starting from 1.
     ///
     /// The return value ranges from 1 to 12.
-    fn month(&self) -> Result<Series> {
-        unimplemented!()
+    fn month(&self) -> Result<UInt32Chunked> {
+        match self.dtype() {
+            DataType::Date32 => self.date32().map(|ca| ca.month()),
+            DataType::Date64 => self.date64().map(|ca| ca.month()),
+            _ => Err(PolarsError::InvalidOperation(
+                format!("operation not supported on dtype {:?}", self.dtype()).into(),
+            )),
+        }
     }
 
     #[cfg(feature = "temporal")]
     #[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
     /// Extract month from underlying NaiveDateTime representation.
     /// Returns the year number in the calendar date.
-    fn year(&self) -> Result<Series> {
-        unimplemented!()
+    fn year(&self) -> Result<Int32Chunked> {
+        match self.dtype() {
+            DataType::Date32 => self.date32().map(|ca| ca.year()),
+            DataType::Date64 => self.date64().map(|ca| ca.year()),
+            _ => Err(PolarsError::InvalidOperation(
+                format!("operation not supported on dtype {:?}", self.dtype()).into(),
+            )),
+        }
     }
 
     #[cfg(feature = "temporal")]
@@ -834,6 +928,13 @@ pub trait SeriesTrait: Send + Sync + private::PrivateSeries {
 
     /// Get a boolean mask of the local minimum peaks.
     fn peak_min(&self) -> BooleanChunked {
+        unimplemented!()
+    }
+
+    /// Check if elements of this Series are in the right Series, or List values of the right Series.
+    #[cfg(feature = "is_in")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "is_in")))]
+    fn is_in(&self, _other: &Series) -> Result<BooleanChunked> {
         unimplemented!()
     }
 }
@@ -992,7 +1093,7 @@ impl Series {
     where
         N: PolarsDataType,
     {
-        self.0.cast_with_datatype(&N::get_dtype())
+        self.0.cast_with_dtype(&N::get_dtype())
     }
     /// Returns `None` if the array is empty or only contains null values.
     /// ```
@@ -1041,18 +1142,6 @@ impl Series {
         self.max_as_series()
             .cast::<Float64Type>()
             .ok()
-            .and_then(|s| s.f64().unwrap().get(0).and_then(T::from))
-    }
-
-    /// Returns the mean value in the array
-    /// Returns an option because the array is nullable.
-    pub fn mean<T>(&self) -> Option<T>
-    where
-        T: NumCast,
-    {
-        self.cast::<Float64Type>()
-            .ok()
-            .map(|s| s.mean_as_series())
             .and_then(|s| s.f64().unwrap().get(0).and_then(T::from))
     }
 
@@ -1130,6 +1219,33 @@ impl Series {
             )),
         }
     }
+
+    /// Create a new ChunkedArray with values from self where the mask evaluates `true` and values
+    /// from `other` where the mask evaluates `false`
+    pub fn zip_with(&self, mask: &BooleanChunked, other: &Series) -> Result<Series> {
+        let (lhs, rhs) = coerce_lhs_rhs(self, other)?;
+        lhs.zip_with_same_type(mask, rhs.as_ref())
+    }
+
+    /// Cast a datelike Series to their physical representation.
+    /// Primitives remain unchanged
+    ///
+    /// * Date32 -> Int32
+    /// * Date64 -> Int64
+    /// * Time64 -> Int64
+    /// * Duration -> Int64
+    ///
+    pub fn to_physical_repr(&self) -> Series {
+        use DataType::*;
+        let out = match self.dtype() {
+            Date32 => self.cast_with_dtype(&DataType::Int32),
+            Date64 => self.cast_with_dtype(&DataType::Int64),
+            Time64(_) => self.cast_with_dtype(&DataType::Int64),
+            Duration(_) => self.cast_with_dtype(&DataType::Int64),
+            _ => return self.clone(),
+        };
+        out.unwrap()
+    }
 }
 
 impl Deref for Series {
@@ -1174,9 +1290,12 @@ impl<'a, T: AsRef<[Option<&'a str>]>> NamedFrom<T, [Option<&'a str>]> for Series
 
 impl_named_from!([String], Utf8Type, new_from_slice);
 impl_named_from!([bool], BooleanType, new_from_slice);
+#[cfg(feature = "dtype-u8")]
 impl_named_from!([u8], UInt8Type, new_from_slice);
+#[cfg(feature = "dtype-u16")]
 impl_named_from!([u16], UInt16Type, new_from_slice);
 impl_named_from!([u32], UInt32Type, new_from_slice);
+#[cfg(feature = "dtype-u64")]
 impl_named_from!([u64], UInt64Type, new_from_slice);
 #[cfg(feature = "dtype-i8")]
 impl_named_from!([i8], Int8Type, new_from_slice);
@@ -1188,9 +1307,12 @@ impl_named_from!([f32], Float32Type, new_from_slice);
 impl_named_from!([f64], Float64Type, new_from_slice);
 impl_named_from!([Option<String>], Utf8Type, new_from_opt_slice);
 impl_named_from!([Option<bool>], BooleanType, new_from_opt_slice);
+#[cfg(feature = "dtype-u8")]
 impl_named_from!([Option<u8>], UInt8Type, new_from_opt_slice);
+#[cfg(feature = "dtype-u16")]
 impl_named_from!([Option<u16>], UInt16Type, new_from_opt_slice);
 impl_named_from!([Option<u32>], UInt32Type, new_from_opt_slice);
+#[cfg(feature = "dtype-u64")]
 impl_named_from!([Option<u64>], UInt64Type, new_from_opt_slice);
 #[cfg(feature = "dtype-i8")]
 impl_named_from!([Option<i8>], Int8Type, new_from_opt_slice);
@@ -1267,9 +1389,12 @@ impl std::convert::TryFrom<(&str, Vec<ArrayRef>)> for Series {
             ArrowDataType::Boolean => {
                 Ok(BooleanChunked::new_from_chunks(name, chunks).into_series())
             }
+            #[cfg(feature = "dtype-u8")]
             ArrowDataType::UInt8 => Ok(UInt8Chunked::new_from_chunks(name, chunks).into_series()),
+            #[cfg(feature = "dtype-u16")]
             ArrowDataType::UInt16 => Ok(UInt16Chunked::new_from_chunks(name, chunks).into_series()),
             ArrowDataType::UInt32 => Ok(UInt32Chunked::new_from_chunks(name, chunks).into_series()),
+            #[cfg(feature = "dtype-u64")]
             ArrowDataType::UInt64 => Ok(UInt64Chunked::new_from_chunks(name, chunks).into_series()),
             #[cfg(feature = "dtype-i8")]
             ArrowDataType::Int8 => Ok(Int8Chunked::new_from_chunks(name, chunks).into_series()),
@@ -1308,7 +1433,7 @@ impl std::convert::TryFrom<(&str, Vec<ArrayRef>)> for Series {
                 #[cfg(feature = "dtype-i8")]
                 return Ok(Int8Chunked::full_null(name, len).into_series());
                 #[cfg(not(feature = "dtype-i8"))]
-                Ok(Int32Chunked::full_null(name, len).into_series())
+                Ok(UInt32Chunked::full_null(name, len).into_series())
             }
             dt => Err(PolarsError::InvalidOperation(
                 format!("Cannot create polars series from {:?} type", dt).into(),
@@ -1328,7 +1453,7 @@ impl TryFrom<(&str, ArrayRef)> for Series {
 
 impl Default for Series {
     fn default() -> Self {
-        UInt8Chunked::default().into_series()
+        Int64Chunked::default().into_series()
     }
 }
 
@@ -1339,6 +1464,38 @@ where
 {
     fn from(ca: ChunkedArray<T>) -> Self {
         ca.into_series()
+    }
+}
+
+impl IntoSeries for Arc<dyn SeriesTrait> {
+    fn into_series(self) -> Series {
+        Series(self)
+    }
+}
+
+impl IntoSeries for Series {
+    fn into_series(self) -> Series {
+        self
+    }
+}
+
+impl<'a, T> AsRef<ChunkedArray<T>> for dyn SeriesTrait + 'a
+where
+    T: 'static + PolarsDataType,
+{
+    fn as_ref(&self) -> &ChunkedArray<T> {
+        if &T::get_dtype() == self.dtype() ||
+            // needed because we want to get ref of List no matter what the inner type is.
+            (matches!(T::get_dtype(), DataType::List(_)) && matches!(self.dtype(), DataType::List(_)) )
+        {
+            unsafe { &*(self as *const dyn SeriesTrait as *const ChunkedArray<T>) }
+        } else {
+            panic!(
+                "implementation error, cannot get ref {:?} from {:?}",
+                T::get_dtype(),
+                self.dtype()
+            )
+        }
     }
 }
 
@@ -1369,7 +1526,7 @@ mod test {
 
     #[test]
     fn new_series_from_arrow_primitive_array() {
-        let array = UInt64Array::from(vec![1, 2, 3, 4, 5]);
+        let array = UInt32Array::from(vec![1, 2, 3, 4, 5]);
         let array_ref: ArrayRef = Arc::new(array);
 
         Series::try_from(("foo", array_ref)).unwrap();
@@ -1385,5 +1542,27 @@ mod test {
         // add wrong type
         let s2 = Series::new("b", &[3.0]);
         assert!(s1.append(&s2).is_err())
+    }
+
+    #[test]
+    fn series_slice_works() {
+        let series = Series::new("a", &[1i64, 2, 3, 4, 5]);
+
+        let slice_1 = series.slice(-3, 3);
+        let slice_2 = series.slice(-5, 5);
+        let slice_3 = series.slice(0, 5);
+
+        assert_eq!(slice_1.get(0), AnyValue::Int64(3));
+        assert_eq!(slice_2.get(0), AnyValue::Int64(1));
+        assert_eq!(slice_3.get(0), AnyValue::Int64(1));
+    }
+
+    #[test]
+    fn out_of_range_slice_does_not_panic() {
+        let series = Series::new("a", &[1i64, 2, 3, 4, 5]);
+
+        series.slice(-3, 4);
+        series.slice(-6, 2);
+        series.slice(4, 2);
     }
 }

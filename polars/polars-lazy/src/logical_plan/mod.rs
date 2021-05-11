@@ -1,5 +1,22 @@
-pub(crate) mod iterator;
-pub(crate) mod optimizer;
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::{
+    cell::Cell,
+    fmt::{self, Debug, Formatter, Write},
+    sync::Arc,
+};
+
+use ahash::RandomState;
+use itertools::Itertools;
+
+use polars_core::frame::hash_join::JoinType;
+use polars_core::prelude::*;
+#[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
+#[cfg(feature = "temporal")]
+use polars_core::utils::chrono::NaiveDateTime;
+use polars_io::csv_core::utils::infer_file_schema;
+#[cfg(feature = "parquet")]
+use polars_io::{parquet::ParquetReader, SerReader};
 
 use crate::logical_plan::LogicalPlan::CsvScan;
 use crate::utils::{
@@ -7,30 +24,22 @@ use crate::utils::{
     rename_expr_root_name,
 };
 use crate::{prelude::*, utils};
-use ahash::RandomState;
-use itertools::Itertools;
-use polars_core::frame::hash_join::JoinType;
-use polars_core::prelude::*;
-use polars_io::csv_core::utils::infer_file_schema;
-use polars_io::prelude::*;
-use std::collections::HashSet;
-use std::{
-    cell::Cell,
-    fmt::{self, Debug, Formatter, Write},
-    sync::Arc,
-};
 
-#[cfg_attr(docsrs, doc(cfg(feature = "temporal")))]
-#[cfg(feature = "temporal")]
-use polars_core::utils::chrono::NaiveDateTime;
+pub(crate) mod aexpr;
+pub(crate) mod alp;
+pub(crate) mod conversion;
+pub(crate) mod iterator;
+pub(crate) mod optimizer;
 
 // Will be set/ unset in the fetch operation to communicate overwriting the number of rows to scan.
 thread_local! {pub(crate) static FETCH_ROWS: Cell<Option<usize>> = Cell::new(None)}
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Context {
+    /// Any operation that is done on groups
     Aggregation,
-    Other,
+    /// Any operation that is done while projection/ selection of data
+    Default,
 }
 
 pub trait DataFrameUdf: Send + Sync {
@@ -60,12 +69,15 @@ pub enum LiteralValue {
     /// A UTF8 encoded string type.
     Utf8(String),
     /// An unsigned 8-bit integer number.
+    #[cfg(feature = "dtype-u8")]
     UInt8(u8),
     /// An unsigned 16-bit integer number.
+    #[cfg(feature = "dtype-u16")]
     UInt16(u16),
     /// An unsigned 32-bit integer number.
     UInt32(u32),
     /// An unsigned 64-bit integer number.
+    #[cfg(feature = "dtype-u64")]
     UInt64(u64),
     /// An 8-bit integer number.
     #[cfg(feature = "dtype-i8")]
@@ -88,6 +100,7 @@ pub enum LiteralValue {
     },
     #[cfg(all(feature = "temporal", feature = "dtype-date64"))]
     DateTime(NaiveDateTime),
+    Series(NoEq<Series>),
 }
 
 impl LiteralValue {
@@ -95,9 +108,12 @@ impl LiteralValue {
     pub fn get_datatype(&self) -> DataType {
         match self {
             LiteralValue::Boolean(_) => DataType::Boolean,
+            #[cfg(feature = "dtype-u8")]
             LiteralValue::UInt8(_) => DataType::UInt8,
+            #[cfg(feature = "dtype-u16")]
             LiteralValue::UInt16(_) => DataType::UInt16,
             LiteralValue::UInt32(_) => DataType::UInt32,
+            #[cfg(feature = "dtype-u64")]
             LiteralValue::UInt64(_) => DataType::UInt64,
             #[cfg(feature = "dtype-i8")]
             LiteralValue::Int8(_) => DataType::Int8,
@@ -111,7 +127,8 @@ impl LiteralValue {
             LiteralValue::Range { data_type, .. } => data_type.clone(),
             #[cfg(all(feature = "temporal", feature = "dtype-date64"))]
             LiteralValue::DateTime(_) => DataType::Date64,
-            _ => panic!("Cannot treat {:?} as scalar value", self),
+            LiteralValue::Series(s) => s.dtype().clone(),
+            LiteralValue::Null => DataType::Null,
         }
     }
 }
@@ -119,16 +136,16 @@ impl LiteralValue {
 // https://stackoverflow.com/questions/1031076/what-are-projection-and-selection
 #[derive(Clone)]
 pub enum LogicalPlan {
-    // filter on a boolean mask
+    /// Filter on a boolean mask
     Selection {
         input: Box<LogicalPlan>,
         predicate: Expr,
     },
-    Cache {
-        input: Box<LogicalPlan>,
-    },
+    /// Cache the input at this point in the LP
+    Cache { input: Box<LogicalPlan> },
+    /// Scan a CSV file
     CsvScan {
-        path: String,
+        path: PathBuf,
         schema: SchemaRef,
         has_header: bool,
         delimiter: u8,
@@ -141,11 +158,13 @@ pub enum LogicalPlan {
         /// Aggregations at the scan level
         aggregate: Vec<Expr>,
         cache: bool,
+        low_memory: bool,
     },
     #[cfg(feature = "parquet")]
     #[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
+    /// Scan a Parquet file
     ParquetScan {
-        path: String,
+        path: PathBuf,
         schema: SchemaRef,
         with_columns: Option<Vec<String>>,
         predicate: Option<Expr>,
@@ -154,6 +173,7 @@ pub enum LogicalPlan {
         cache: bool,
     },
     // we keep track of the projection and selection as it is cheaper to first project and then filter
+    /// In memory DataFrame
     DataFrameScan {
         df: Arc<DataFrame>,
         schema: SchemaRef,
@@ -167,12 +187,13 @@ pub enum LogicalPlan {
         input: Box<LogicalPlan>,
         schema: SchemaRef,
     },
-    // vertical selection
+    /// Column selection
     Projection {
         expr: Vec<Expr>,
         input: Box<LogicalPlan>,
         schema: SchemaRef,
     },
+    /// Groupby aggregation
     Aggregate {
         input: Box<LogicalPlan>,
         keys: Arc<Vec<Expr>>,
@@ -180,6 +201,7 @@ pub enum LogicalPlan {
         schema: SchemaRef,
         apply: Option<Arc<dyn DataFrameUdf>>,
     },
+    /// Join operation
     Join {
         input_left: Box<LogicalPlan>,
         input_right: Box<LogicalPlan>,
@@ -190,36 +212,43 @@ pub enum LogicalPlan {
         allow_par: bool,
         force_par: bool,
     },
+    /// Adding columns to the table without a Join
     HStack {
         input: Box<LogicalPlan>,
         exprs: Vec<Expr>,
         schema: SchemaRef,
     },
+    /// Remove duplicates from the table
     Distinct {
         input: Box<LogicalPlan>,
         maintain_order: bool,
         subset: Arc<Option<Vec<String>>>,
     },
+    /// Sort the table
     Sort {
         input: Box<LogicalPlan>,
-        by_column: String,
-        reverse: bool,
+        by_column: Vec<Expr>,
+        reverse: Vec<bool>,
     },
+    /// An explode operation
     Explode {
         input: Box<LogicalPlan>,
         columns: Vec<String>,
     },
+    /// Slice the table
     Slice {
         input: Box<LogicalPlan>,
-        offset: usize,
+        offset: i64,
         len: usize,
     },
+    /// A Melt operation
     Melt {
         input: Box<LogicalPlan>,
         id_vars: Arc<Vec<String>>,
         value_vars: Arc<Vec<String>>,
         schema: SchemaRef,
     },
+    /// A User Defined Function
     Udf {
         input: Box<LogicalPlan>,
         function: Arc<dyn DataFrameUdf>,
@@ -234,7 +263,7 @@ pub enum LogicalPlan {
 impl Default for LogicalPlan {
     fn default() -> Self {
         CsvScan {
-            path: "".to_string(),
+            path: PathBuf::new(),
             schema: Arc::new(Schema::new(vec![Field::new("", DataType::Null)])),
             has_header: false,
             delimiter: b',',
@@ -245,6 +274,7 @@ impl Default for LogicalPlan {
             predicate: None,
             aggregate: vec![],
             cache: true,
+            low_memory: false,
         }
     }
 }
@@ -270,7 +300,10 @@ impl fmt::Debug for LogicalPlan {
                 write!(
                     f,
                     "PARQUET SCAN {}; PROJECT {}/{} COLUMNS; SELECTION: {:?}",
-                    path, n_columns, total_columns, predicate
+                    path.to_string_lossy(),
+                    n_columns,
+                    total_columns,
+                    predicate
                 )
             }
             Selection { predicate, input } => {
@@ -294,7 +327,10 @@ impl fmt::Debug for LogicalPlan {
                 write!(
                     f,
                     "CSV SCAN {}; PROJECT {}/{} COLUMNS; SELECTION: {:?}",
-                    path, n_columns, total_columns, predicate
+                    path.to_string_lossy(),
+                    n_columns,
+                    total_columns,
+                    predicate
                 )
             }
             DataFrameScan {
@@ -336,7 +372,7 @@ impl fmt::Debug for LogicalPlan {
             }
             Sort {
                 input, by_column, ..
-            } => write!(f, "SORT {:?} BY COLUMN {}", input, by_column),
+            } => write!(f, "SORT {:?} BY {:?}", input, by_column),
             Explode { input, columns, .. } => {
                 write!(f, "EXPLODE COLUMN(S) {:?} OF {:?}", columns, input)
             }
@@ -397,19 +433,31 @@ impl LogicalPlan {
         }
     }
 
-    pub(crate) fn dot(&self, acc_str: &mut String, id: usize, prev_node: &str) -> std::fmt::Result {
+    ///
+    /// # Arguments
+    /// `id` - (branch, id)
+    ///     Used to make sure that the dot boxes are distinct.
+    ///     branch is an id per join branch
+    ///     id is incremented by the depth traversal of the tree.
+    pub(crate) fn dot(
+        &self,
+        acc_str: &mut String,
+        id: (usize, usize),
+        prev_node: &str,
+    ) -> std::fmt::Result {
         use LogicalPlan::*;
+        let (branch, id) = id;
         match self {
             Cache { input } => {
-                let current_node = format!("CACHE [{}]", id);
+                let current_node = format!("CACHE [{:?}]", (branch, id));
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             Selection { predicate, input } => {
                 let pred = fmt_predicate(Some(predicate));
-                let current_node = format!("FILTER BY {} [{}]", pred, id);
+                let current_node = format!("FILTER BY {} [{:?}]", pred, (branch, id));
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             CsvScan {
                 path,
@@ -426,8 +474,12 @@ impl LogicalPlan {
                 let pred = fmt_predicate(predicate.as_ref());
 
                 let current_node = format!(
-                    "CSV SCAN {};\nπ {}/{};\nσ {}\n[{}]",
-                    path, n_columns, total_columns, pred, id
+                    "CSV SCAN {};\nπ {}/{};\nσ {}\n[{:?}]",
+                    path.to_string_lossy(),
+                    n_columns,
+                    total_columns,
+                    pred,
+                    (branch, id)
                 );
                 if id == 0 {
                     self.write_dot(acc_str, prev_node, &current_node, id)?;
@@ -450,8 +502,11 @@ impl LogicalPlan {
 
                 let pred = fmt_predicate(selection.as_ref());
                 let current_node = format!(
-                    "TABLE\nπ {}/{};\nσ {}\n[{}]",
-                    n_columns, total_columns, pred, id
+                    "TABLE\nπ {}/{};\nσ {}\n[{:?}]",
+                    n_columns,
+                    total_columns,
+                    pred,
+                    (branch, id)
                 );
                 if id == 0 {
                     self.write_dot(acc_str, prev_node, &current_node, id)?;
@@ -462,40 +517,40 @@ impl LogicalPlan {
             }
             Projection { expr, input, .. } => {
                 let current_node = format!(
-                    "π {}/{} [{}]",
+                    "π {}/{} [{:?}]",
                     expr.len(),
                     input.schema().fields().len(),
-                    id
+                    (branch, id)
                 );
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             Sort {
                 input, by_column, ..
             } => {
-                let current_node = format!("SORT by {} [{}]", by_column, id);
+                let current_node = format!("SORT BY {:?} [{}]", by_column, id);
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             LocalProjection { expr, input, .. } => {
                 let current_node = format!(
-                    "LOCAL π {}/{} [{}]",
+                    "LOCAL π {}/{} [{:?}]",
                     expr.len(),
                     input.schema().fields().len(),
-                    id
+                    (branch, id)
                 );
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             Explode { input, columns, .. } => {
-                let current_node = format!("EXPLODE {:?} [{}]", columns, id);
+                let current_node = format!("EXPLODE {:?} [{:?}]", columns, (branch, id));
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             Melt { input, .. } => {
-                let current_node = format!("MELT [{}]", id);
+                let current_node = format!("MELT [{:?}]", (branch, id));
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             Aggregate {
                 input, keys, aggs, ..
@@ -504,9 +559,9 @@ impl LogicalPlan {
                 for key in keys.iter() {
                     s_keys.push_str(&format!("{:?}", key));
                 }
-                let current_node = format!("AGG {:?} BY {} [{}]", aggs, s_keys, id);
+                let current_node = format!("AGG {:?} BY {} [{:?}]", aggs, s_keys, (branch, id));
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             HStack { input, exprs, .. } => {
                 let mut current_node = String::with_capacity(128);
@@ -520,14 +575,19 @@ impl LogicalPlan {
                         }
                     }
                 }
-                current_node.push_str(&format!(" [{}]", id));
+                current_node.push_str(&format!(" [{:?}]", (branch, id)));
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             Slice { input, offset, len } => {
-                let current_node = format!("SLICE offset: {}; len: {} [{}]", offset, len, id);
+                let current_node = format!(
+                    "SLICE offset: {}; len: {} [{:?}]",
+                    offset,
+                    len,
+                    (branch, id)
+                );
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             Distinct { input, subset, .. } => {
                 let mut current_node = String::with_capacity(128);
@@ -538,10 +598,10 @@ impl LogicalPlan {
                         current_node.push_str(&format!("{}, ", name));
                     }
                 }
-                current_node.push_str(&format!(" [{}]", id));
+                current_node.push_str(&format!(" [{:?}]", (branch, id)));
 
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
             #[cfg(feature = "parquet")]
             ParquetScan {
@@ -559,8 +619,12 @@ impl LogicalPlan {
 
                 let pred = fmt_predicate(predicate.as_ref());
                 let current_node = format!(
-                    "PARQUET SCAN {};\nπ {}/{};\nσ {} [{}]",
-                    path, n_columns, total_columns, pred, id
+                    "PARQUET SCAN {};\nπ {}/{};\nσ {} [{:?}]",
+                    path.to_string_lossy(),
+                    n_columns,
+                    total_columns,
+                    pred,
+                    (branch, id)
                 );
                 if id == 0 {
                     self.write_dot(acc_str, prev_node, &current_node, id)?;
@@ -579,15 +643,23 @@ impl LogicalPlan {
                 let current_node =
                     format!("JOIN left {:?}; right: {:?} [{}]", left_on, right_on, id);
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input_left.dot(acc_str, id + 1, &current_node)?;
-                input_right.dot(acc_str, id + 1, &current_node)
+                input_left.dot(acc_str, (branch + 10, id + 1), &current_node)?;
+                input_right.dot(acc_str, (branch + 20, id + 1), &current_node)
             }
             Udf { input, .. } => {
-                let current_node = format!("UDF [{}]", id);
+                let current_node = format!("UDF [{:?}]", (branch, id));
                 self.write_dot(acc_str, prev_node, &current_node, id)?;
-                input.dot(acc_str, id + 1, &current_node)
+                input.dot(acc_str, (branch, id + 1), &current_node)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_alp(self) -> (Node, Arena<ALogicalPlan>, Arena<AExpr>) {
+        let mut lp_arena = Arena::with_capacity(16);
+        let mut expr_arena = Arena::with_capacity(16);
+        let root = to_alp(self, &mut expr_arena, &mut lp_arena);
+        (root, lp_arena, expr_arena)
     }
 }
 
@@ -602,8 +674,8 @@ fn replace_wildcard_with_column(expr: Expr, column_name: Arc<String>) -> Expr {
             partition_by,
             order_by,
         },
-        Expr::Unique(expr) => {
-            Expr::Unique(Box::new(replace_wildcard_with_column(*expr, column_name)))
+        Expr::IsUnique(expr) => {
+            Expr::IsUnique(Box::new(replace_wildcard_with_column(*expr, column_name)))
         }
         Expr::Duplicated(expr) => {
             Expr::Duplicated(Box::new(replace_wildcard_with_column(*expr, column_name)))
@@ -614,6 +686,10 @@ fn replace_wildcard_with_column(expr: Expr, column_name: Arc<String>) -> Expr {
         Expr::Explode(expr) => {
             Expr::Explode(Box::new(replace_wildcard_with_column(*expr, column_name)))
         }
+        Expr::Take { expr, idx } => Expr::Take {
+            expr: Box::new(replace_wildcard_with_column(*expr, column_name)),
+            idx,
+        },
         Expr::Ternary {
             predicate,
             truthy,
@@ -661,6 +737,9 @@ fn replace_wildcard_with_column(expr: Expr, column_name: Arc<String>) -> Expr {
             Box::new(replace_wildcard_with_column(*e, column_name)),
             name,
         ),
+        Expr::Filter { .. } => {
+            panic!("Expression filter may not be used with wildcard, use LazyFrame::filter")
+        }
         Expr::Agg(agg) => match agg {
             AggExpr::Mean(e) => {
                 AggExpr::Mean(Box::new(replace_wildcard_with_column(*e, column_name)))
@@ -720,6 +799,11 @@ fn replace_wildcard_with_column(expr: Expr, column_name: Arc<String>) -> Expr {
             offset,
             length,
         },
+        Expr::SortBy { expr, by, reverse } => Expr::SortBy {
+            expr: Box::new(replace_wildcard_with_column(*expr, column_name)),
+            by,
+            reverse,
+        },
         Expr::Sort { expr, reverse } => Expr::Sort {
             expr: Box::new(replace_wildcard_with_column(*expr, column_name)),
             reverse,
@@ -751,12 +835,11 @@ fn rewrite_projections(exprs: Vec<Expr>, schema: &Schema) -> Vec<Expr> {
             }
         }
 
-        let has_wildcard = has_expr(&expr, &Expr::Wildcard);
+        let has_wildcard = has_expr(&expr, |e| matches!(e, Expr::Wildcard));
 
         if has_wildcard {
             // if count wildcard. count one column
-            let dummy = &Expr::Agg(AggExpr::Count(Box::new(Expr::Wildcard)));
-            if has_expr(&expr, dummy) {
+            if has_expr(&expr, |e| matches!(e, Expr::Agg(AggExpr::Count(_)))) {
                 let new_name = Arc::new(schema.field(0).unwrap().name().clone());
                 let expr = rename_expr_root_name(&expr, new_name).unwrap();
 
@@ -836,14 +919,19 @@ impl From<LogicalPlan> for LogicalPlanBuilder {
 
 pub(crate) fn prepare_projection(exprs: Vec<Expr>, schema: &Schema) -> (Vec<Expr>, Schema) {
     let exprs = rewrite_projections(exprs, schema);
-    let schema = utils::expressions_to_schema(&exprs, schema, Context::Other);
+    let schema = utils::expressions_to_schema(&exprs, schema, Context::Default);
     (exprs, schema)
 }
 
 impl LogicalPlanBuilder {
     #[cfg(feature = "parquet")]
     #[cfg_attr(docsrs, doc(cfg(feature = "parquet")))]
-    pub fn scan_parquet(path: String, stop_after_n_rows: Option<usize>, cache: bool) -> Self {
+    pub fn scan_parquet<P: Into<PathBuf>>(
+        path: P,
+        stop_after_n_rows: Option<usize>,
+        cache: bool,
+    ) -> Self {
+        let path = path.into();
         let file = std::fs::File::open(&path).expect("could not open file");
         let schema = Arc::new(
             ParquetReader::new(file)
@@ -864,8 +952,8 @@ impl LogicalPlanBuilder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn scan_csv(
-        path: String,
+    pub fn scan_csv<P: Into<PathBuf>>(
+        path: P,
         delimiter: u8,
         has_header: bool,
         ignore_errors: bool,
@@ -874,7 +962,9 @@ impl LogicalPlanBuilder {
         cache: bool,
         schema: Option<Arc<Schema>>,
         schema_overwrite: Option<&Schema>,
+        low_memory: bool,
     ) -> Self {
+        let path = path.into();
         let mut file = std::fs::File::open(&path).expect("could not open file");
 
         let schema = schema.unwrap_or_else(|| {
@@ -900,6 +990,7 @@ impl LogicalPlanBuilder {
             predicate: None,
             aggregate: vec![],
             cache,
+            low_memory,
         }
         .into()
     }
@@ -964,7 +1055,7 @@ impl LogicalPlanBuilder {
         let mut new_fields = schema.fields().clone();
 
         for e in &exprs {
-            let field = e.to_field(schema, Context::Other).unwrap();
+            let field = e.to_field(schema, Context::Default).unwrap();
             match schema.index_of(field.name()) {
                 Ok(idx) => {
                     new_fields[idx] = field;
@@ -985,7 +1076,7 @@ impl LogicalPlanBuilder {
 
     /// Apply a filter
     pub fn filter(self, predicate: Expr) -> Self {
-        let predicate = if has_expr(&predicate, &Expr::Wildcard) {
+        let predicate = if has_expr(&predicate, |e| matches!(e, Expr::Wildcard)) {
             let it = self.0.schema().fields().iter().map(|field| {
                 replace_wildcard_with_column(predicate.clone(), Arc::new(field.name().clone()))
             });
@@ -1010,7 +1101,7 @@ impl LogicalPlanBuilder {
         let current_schema = self.0.schema();
         let aggs = rewrite_projections(aggs, current_schema);
 
-        let schema1 = utils::expressions_to_schema(&keys, current_schema, Context::Other);
+        let schema1 = utils::expressions_to_schema(&keys, current_schema, Context::Default);
         let schema2 = utils::expressions_to_schema(&aggs, current_schema, Context::Aggregation);
         let schema = Schema::try_merge(&[schema1, schema2]).unwrap();
 
@@ -1039,7 +1130,7 @@ impl LogicalPlanBuilder {
         .into()
     }
 
-    pub fn sort(self, by_column: String, reverse: bool) -> Self {
+    pub fn sort(self, by_column: Vec<Expr>, reverse: Vec<bool>) -> Self {
         LogicalPlan::Sort {
             input: Box::new(self.0),
             by_column,
@@ -1076,7 +1167,7 @@ impl LogicalPlanBuilder {
         .into()
     }
 
-    pub fn slice(self, offset: usize, len: usize) -> Self {
+    pub fn slice(self, offset: i64, len: usize) -> Self {
         LogicalPlan::Slice {
             input: Box::new(self.0),
             offset,
@@ -1183,10 +1274,11 @@ pub(crate) fn det_melt_schema(value_vars: &[String], input_schema: &Schema) -> S
 
 #[cfg(test)]
 mod test {
-    use crate::prelude::*;
-    use crate::tests::get_df;
     use polars_core::df;
     use polars_core::prelude::*;
+
+    use crate::prelude::*;
+    use crate::tests::get_df;
 
     fn print_plans(lf: &LazyFrame) {
         println!("LOGICAL PLAN\n\n{}\n", lf.describe_plan());
@@ -1356,7 +1448,7 @@ mod test {
         left.lazy()
             .select(&[col("days")])
             .logical_plan
-            .dot(&mut s, 0, "")
+            .dot(&mut s, (0, 0), "")
             .unwrap();
         println!("{}", s);
     }

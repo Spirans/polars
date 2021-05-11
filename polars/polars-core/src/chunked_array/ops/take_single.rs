@@ -2,7 +2,6 @@ use crate::prelude::*;
 use arrow::array::{
     Array, ArrayRef, BooleanArray, LargeListArray, LargeStringArray, PrimitiveArray,
 };
-use polars_arrow::prelude::*;
 use std::convert::TryFrom;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -80,7 +79,7 @@ impl TakeRandom for BooleanChunked {
     #[inline]
     fn get(&self, index: usize) -> Option<Self::Item> {
         // Safety:
-        // Out of bounds is checkedn and downcast is of correct type
+        // Out of bounds is checked and downcast is of correct type
         unsafe { impl_take_random_get!(self, index, BooleanArray) }
     }
 
@@ -108,7 +107,7 @@ impl<'a> TakeRandom for &'a Utf8Chunked {
     #[inline]
     fn get(&self, index: usize) -> Option<Self::Item> {
         // Safety:
-        // Out of bounds is checkedn and downcast is of correct type
+        // Out of bounds is checked and downcast is of correct type
         unsafe { impl_take_random_get!(self, index, LargeStringArray) }
     }
 

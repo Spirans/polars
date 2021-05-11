@@ -2,9 +2,9 @@
 use crate::chunked_array::builder::CategoricalChunkedBuilder;
 use crate::chunked_array::kernels::{cast_numeric_from_dtype, transmute_array_from_dtype};
 use crate::prelude::*;
-use crate::use_string_cache;
+use arrow::array::{make_array, Array, ArrayDataBuilder};
 use arrow::compute::cast;
-use num::{NumCast, ToPrimitive};
+use num::NumCast;
 
 fn cast_ca<N, T>(ca: &ChunkedArray<T>) -> Result<ChunkedArray<N>>
 where
@@ -18,14 +18,6 @@ where
             Ok(ca)
         };
     };
-
-    // only i32 can be cast to Date32
-    if let DataType::Date32 = N::get_dtype() {
-        if T::get_dtype() != ArrowDataType::Int32 {
-            let casted_i32 = cast_ca::<Int32Type, _>(ca)?;
-            return cast_ca(&casted_i32);
-        }
-    }
     let chunks = ca
         .chunks
         .iter()
@@ -36,14 +28,60 @@ where
 }
 
 macro_rules! cast_from_dtype {
-    ($self: expr, $kernel:expr, $dtype: ident) => {{
+    ($self: expr, $kernel:expr, $dtype: expr) => {{
         let chunks = $self
-            .downcast_chunks()
+            .downcast_iter()
             .into_iter()
-            .map(|arr| $kernel(arr, ArrowDataType::$dtype))
+            .map(|arr| $kernel(arr, $dtype))
             .collect();
 
         Ok(ChunkedArray::new_from_chunks($self.field.name(), chunks))
+    }};
+}
+
+macro_rules! cast_with_dtype {
+    ($self:expr, $data_type:expr) => {{
+        use DataType::*;
+        match $data_type {
+            Boolean => ChunkCast::cast::<BooleanType>($self).map(|ca| ca.into_series()),
+            Utf8 => ChunkCast::cast::<Utf8Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-u8")]
+            UInt8 => ChunkCast::cast::<UInt8Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-u16")]
+            UInt16 => ChunkCast::cast::<UInt16Type>($self).map(|ca| ca.into_series()),
+            UInt32 => ChunkCast::cast::<UInt32Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-u64")]
+            UInt64 => ChunkCast::cast::<UInt64Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-i8")]
+            Int8 => ChunkCast::cast::<Int8Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-i16")]
+            Int16 => ChunkCast::cast::<Int16Type>($self).map(|ca| ca.into_series()),
+            Int32 => ChunkCast::cast::<Int32Type>($self).map(|ca| ca.into_series()),
+            Int64 => ChunkCast::cast::<Int64Type>($self).map(|ca| ca.into_series()),
+            Float32 => ChunkCast::cast::<Float32Type>($self).map(|ca| ca.into_series()),
+            Float64 => ChunkCast::cast::<Float64Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-date32")]
+            Date32 => ChunkCast::cast::<Date32Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-date64")]
+            Date64 => ChunkCast::cast::<Date64Type>($self).map(|ca| ca.into_series()),
+            #[cfg(feature = "dtype-time64-ns")]
+            Time64(TimeUnit::Nanosecond) => {
+                ChunkCast::cast::<Time64NanosecondType>($self).map(|ca| ca.into_series())
+            }
+            #[cfg(feature = "dtype-duration-ns")]
+            Duration(TimeUnit::Nanosecond) => {
+                ChunkCast::cast::<DurationNanosecondType>($self).map(|ca| ca.into_series())
+            }
+            #[cfg(feature = "dtype-duration-ms")]
+            Duration(TimeUnit::Millisecond) => {
+                ChunkCast::cast::<DurationMillisecondType>($self).map(|ca| ca.into_series())
+            }
+            List(_) => ChunkCast::cast::<ListType>($self).map(|ca| ca.into_series()),
+            Categorical => ChunkCast::cast::<CategoricalType>($self).map(|ca| ca.into_series()),
+            dt => Err(PolarsError::Other(
+                format!("Casting to {:?} is not supported", dt).into(),
+            )),
+        }
     }};
 }
 
@@ -58,7 +96,7 @@ impl ChunkCast for CategoricalChunked {
 
                 let mut builder = Utf8ChunkedBuilder::new(self.name(), self.len(), self.len() * 5);
 
-                let f = |idx: u32| mapping.get(&idx).unwrap();
+                let f = |idx: u32| mapping.get(idx);
 
                 if self.null_count() == 0 {
                     self.into_no_null_iter()
@@ -74,97 +112,57 @@ impl ChunkCast for CategoricalChunked {
                 Ok(ca)
             }
             DataType::UInt32 => {
-                let ca: ChunkedArray<N> = unsafe { std::mem::transmute(self.clone()) };
+                let mut ca: ChunkedArray<N> = unsafe { std::mem::transmute(self.clone()) };
+                ca.field = Arc::new(Field::new(ca.name(), DataType::UInt32));
                 Ok(ca)
             }
             _ => cast_ca(self),
         }
+    }
+    fn cast_with_dtype(&self, data_type: &DataType) -> Result<Series> {
+        cast_with_dtype!(self, data_type)
     }
 }
 
 impl<T> ChunkCast for ChunkedArray<T>
 where
     T: PolarsNumericType,
-    T::Native: NumCast + ToPrimitive,
+    T::Native: NumCast,
 {
     fn cast<N>(&self) -> Result<ChunkedArray<N>>
     where
         N: PolarsDataType,
     {
-        let ca = match T::get_dtype() {
-            DataType::UInt32 => match N::get_dtype() {
-                DataType::Categorical => {
-                    let ca: ChunkedArray<N> = unsafe { std::mem::transmute(self.clone()) };
-                    Ok(ca)
-                }
-                _ => cast_ca(self),
+        use DataType::*;
+        let ca = match (T::get_dtype(), N::get_dtype()) {
+            (UInt32, Categorical) => {
+                let mut ca: ChunkedArray<N> = unsafe { std::mem::transmute(self.clone()) };
+                ca.field = Arc::new(Field::new(ca.name(), DataType::Categorical));
+                return Ok(ca);
+            }
+            // the underlying datatype is i64 so we transmute array
+            (Duration(_), Int64) => unsafe {
+                cast_from_dtype!(self, transmute_array_from_dtype, Int64.to_arrow())
             },
-
-            // Duration cast is not implemented in Arrow
-            DataType::Duration(_) => {
-                // underlying type: i64
-                match N::get_dtype() {
-                    DataType::UInt64 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, UInt64)
-                    }
-                    // the underlying datatype is i64 so we transmute array
-                    DataType::Int64 => unsafe {
-                        cast_from_dtype!(self, transmute_array_from_dtype, Int64)
-                    },
-                    DataType::Float32 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Float32)
-                    }
-                    DataType::Float64 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Float64)
-                    }
-                    _ => cast_ca(self),
-                }
+            // paths not supported by arrow kernel
+            // to float32
+            (Duration(_), Float32) | (Date32, Float32) | (Date64, Float32)
+            // to float64
+            | (Duration(_), Float64) | (Date32, Float64) | (Date64, Float64)
+            // underlying type: i64
+            | (Duration(_), UInt64)
+            => {
+                cast_from_dtype!(self, cast_numeric_from_dtype, N::get_dtype().to_arrow())
             }
-            DataType::Date32 => {
-                match N::get_dtype() {
-                    // underlying type: i32
-                    DataType::Int32 => cast_ca(self),
-                    DataType::Int64 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Int64)
-                    }
-                    DataType::Float32 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Float32)
-                    }
-                    DataType::Float64 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Float64)
-                    }
-                    #[cfg(feature = "temporal")]
-                    DataType::Utf8 => {
-                        let ca: ChunkedArray<N> = unsafe {
-                            std::mem::transmute(self.cast::<Date32Type>().unwrap().str_fmt("%F"))
-                        };
-                        Ok(ca)
-                    }
-                    _ => cast_ca(self),
-                }
+            // to date64
+            (Float64, Date64) | (Float32, Date64) => {
+                let out: Result<Int64Chunked> = cast_from_dtype!(self, cast_numeric_from_dtype, Int64.to_arrow());
+                out?.cast::<N>()
             }
-            DataType::Date64 => {
-                match N::get_dtype() {
-                    // underlying type: i32
-                    DataType::Int32 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Int32)
-                    }
-                    DataType::Int64 => cast_ca(self),
-                    DataType::Float32 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Float32)
-                    }
-                    DataType::Float64 => {
-                        cast_from_dtype!(self, cast_numeric_from_dtype, Float64)
-                    }
-                    #[cfg(feature = "temporal")]
-                    DataType::Utf8 => {
-                        let ca: ChunkedArray<N> = unsafe {
-                            std::mem::transmute(self.cast::<Date64Type>().unwrap().str_fmt("%+"))
-                        };
-                        Ok(ca)
-                    }
-                    _ => cast_ca(self),
-                }
+            // to date64
+            (Float64, Date32) | (Float32, Date32) => {
+                let out: Result<Int32Chunked> = cast_from_dtype!(self, cast_numeric_from_dtype, Int32.to_arrow());
+                out?.cast::<N>()
             }
             _ => cast_ca(self),
         };
@@ -173,19 +171,10 @@ where
             ca
         })
     }
-}
 
-macro_rules! impl_chunkcast {
-    ($ca_type:ident) => {
-        impl ChunkCast for $ca_type {
-            fn cast<N>(&self) -> Result<ChunkedArray<N>>
-            where
-                N: PolarsDataType,
-            {
-                cast_ca(self)
-            }
-        }
-    };
+    fn cast_with_dtype(&self, data_type: &DataType) -> Result<Series> {
+        cast_with_dtype!(self, data_type)
+    }
 }
 
 impl ChunkCast for Utf8Chunked {
@@ -195,18 +184,9 @@ impl ChunkCast for Utf8Chunked {
     {
         match N::get_dtype() {
             DataType::Categorical => {
+                let iter = self.into_iter();
                 let mut builder = CategoricalChunkedBuilder::new(self.name(), self.len());
-
-                if use_string_cache() || self.null_count() != 0 {
-                    builder.append_values(self.into_iter());
-                } else if self.null_count() == 0 {
-                    self.into_no_null_iter()
-                        .for_each(|v| builder.append_value(v));
-                } else {
-                    self.into_iter()
-                        .for_each(|opt_v| builder.append_option(opt_v));
-                }
-
+                builder.from_iter(iter);
                 let ca = builder.finish();
                 let ca = unsafe { std::mem::transmute(ca) };
                 Ok(ca)
@@ -214,7 +194,103 @@ impl ChunkCast for Utf8Chunked {
             _ => cast_ca(self),
         }
     }
+    fn cast_with_dtype(&self, data_type: &DataType) -> Result<Series> {
+        cast_with_dtype!(self, data_type)
+    }
 }
 
-impl_chunkcast!(BooleanChunked);
-impl_chunkcast!(ListChunked);
+impl ChunkCast for BooleanChunked {
+    fn cast<N>(&self) -> Result<ChunkedArray<N>>
+    where
+        N: PolarsDataType,
+    {
+        cast_ca(self)
+    }
+    fn cast_with_dtype(&self, data_type: &DataType) -> Result<Series> {
+        cast_with_dtype!(self, data_type)
+    }
+}
+
+/// We cannot cast anything to or from List/LargeList
+/// So this implementation casts the inner tyupe
+impl ChunkCast for ListChunked {
+    fn cast<N>(&self) -> Result<ChunkedArray<N>>
+    where
+        N: PolarsDataType,
+    {
+        match N::get_dtype() {
+            // Cast list inner type
+            DataType::List(child_type) => {
+                let chunks = self
+                    .downcast_iter()
+                    .map(|list| {
+                        let ad = list.data().clone();
+                        let child = ad.child_data()[0].clone();
+                        let child = make_array(child);
+                        let child = cast(&child, &child_type)?;
+
+                        let new = ArrayDataBuilder::new(ArrowDataType::LargeList(Box::new(
+                            ArrowField::new("", child.data_type().clone(), true),
+                        )))
+                        .len(list.len())
+                        .buffers(ad.buffers().to_vec())
+                        .add_child_data(child.data().clone())
+                        .build();
+                        Ok(make_array(new))
+                    })
+                    .collect::<Result<_>>()?;
+                let ca = ListChunked::new_from_chunks(self.name(), chunks);
+                let ca = unsafe { std::mem::transmute(ca) };
+                Ok(ca)
+            }
+            _ => Err(PolarsError::Other("Cannot cast list type".into())),
+        }
+    }
+    fn cast_with_dtype(&self, data_type: &DataType) -> Result<Series> {
+        match data_type {
+            DataType::List(child_type) => {
+                let chunks = self
+                    .downcast_iter()
+                    .map(|list| {
+                        let ad = list.data().clone();
+                        let child = ad.child_data()[0].clone();
+                        let child = make_array(child);
+                        let child = cast(&child, &child_type)?;
+
+                        let new = ArrayDataBuilder::new(ArrowDataType::LargeList(Box::new(
+                            ArrowField::new("", child.data_type().clone(), true),
+                        )))
+                        .len(list.len())
+                        .buffers(ad.buffers().to_vec())
+                        .add_child_data(child.data().clone())
+                        .build();
+                        Ok(make_array(new))
+                    })
+                    .collect::<Result<_>>()?;
+                let ca = ListChunked::new_from_chunks(self.name(), chunks);
+                Ok(ca.into_series())
+            }
+            _ => Err(PolarsError::Other("Cannot cast list type".into())),
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::prelude::*;
+    use polars_arrow::builder::PrimitiveArrayBuilder;
+
+    #[test]
+    fn test_cast_list() -> Result<()> {
+        let mut builder =
+            ListPrimitiveChunkedBuilder::<Int32Type>::new("a", PrimitiveArrayBuilder::new(10), 10);
+        builder.append_slice(Some(&[1i32, 2, 3]));
+        builder.append_slice(Some(&[1i32, 2, 3]));
+        let ca = builder.finish();
+
+        let new = ca.cast_with_dtype(&DataType::List(ArrowDataType::Float64))?;
+
+        assert_eq!(new.dtype(), &DataType::List(ArrowDataType::Float64));
+        Ok(())
+    }
+}

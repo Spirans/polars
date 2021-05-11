@@ -13,12 +13,21 @@ import pandas as pd
 from utils import get_complete_df
 
 
+def test_version():
+    pl.__version__
+
+
 def test_init():
-    df = DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
+    df = pl.DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0]})
+    assert df.shape == (3, 2)
 
     # length mismatch
     with pytest.raises(RuntimeError):
-        df = DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0, 4.0]})
+        pl.DataFrame({"a": [1, 2, 3], "b": [1.0, 2.0, 3.0, 4.0]})
+
+    df = pl.DataFrame(np.random.randn(3, 5))
+    assert df.shape == (3, 5)
+    assert df.columns == ["0", "1", "2", "3", "4"]
 
 
 def test_selection():
@@ -39,6 +48,20 @@ def test_selection():
     assert df.select_at_idx(0).name == "a"
     assert (df.a == df["a"]).sum() == 3
     assert (df.c == df["a"]).sum() == 0
+    assert df[:, "a":"b"].shape == (3, 2)
+
+
+def test_from_arrow():
+    tbl = pa.table(
+        {
+            "a": pa.array([1, 2], pa.timestamp("s")),
+            "b": pa.array([1, 2], pa.timestamp("ms")),
+            "c": pa.array([1, 2], pa.timestamp("us")),
+            "d": pa.array([1, 2], pa.timestamp("ns")),
+            "decimal1": pa.array([1, 2], pa.decimal128(2, 2)),
+        }
+    )
+    assert pl.from_arrow_table(tbl).shape == (2, 5)
 
 
 def test_downsample():
@@ -127,46 +150,54 @@ def test_groupby():
         }
     )
 
+    # use __getitem__ to map to select
+    assert (
+        df.groupby("a")["b"]
+        .sum()
+        .sort(by="a")
+        .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [4, 11, 6]}))
+    )
+
     assert (
         df.groupby("a")
         .select("b")
         .sum()
-        .sort(by_column="a")
+        .sort(by="a")
         .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [4, 11, 6]}))
     )
     assert (
         df.groupby("a")
         .select("c")
         .sum()
-        .sort(by_column="a")
+        .sort(by="a")
         .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [10, 10, 1]}))
     )
     assert (
         df.groupby("a")
         .select("b")
         .min()
-        .sort(by_column="a")
+        .sort(by="a")
         .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [1, 2, 6]}))
     )
     assert (
         df.groupby("a")
         .select("b")
         .max()
-        .sort(by_column="a")
+        .sort(by="a")
         .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [3, 5, 6]}))
     )
     assert (
         df.groupby("a")
         .select("b")
         .mean()
-        .sort(by_column="a")
+        .sort(by="a")
         .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [2.0, (2 + 4 + 5) / 3, 6.0]}))
     )
     assert (
         df.groupby("a")
         .select("b")
         .last()
-        .sort(by_column="a")
+        .sort(by="a")
         .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [3, 5, 6]}))
     )
     # check if it runs
@@ -185,6 +216,19 @@ def test_groupby():
     #     DataFrame({"a": ["a", "b", "c"], "": [2, 3, 1]})
     # )
     assert df.groupby("a").apply(lambda df: df[["c"]].sum()).sort("c")["c"][0] == 1
+
+    assert df.groupby("a").groups().sort("a")["a"].series_equal(Series(["a", "b", "c"]))
+
+    for subdf in df.groupby("a"):
+        if subdf["a"][0] == "b":
+            assert subdf.shape == (3, 3)
+
+    assert df.groupby("a").get_group("c").shape == (1, 3)
+    assert df.groupby("a").get_group("b").shape == (3, 3)
+    assert df.groupby("a").get_group("a").shape == (2, 3)
+
+    # Use lazy API in eager groupby
+    assert df.groupby("a").agg([pl.sum("b")]).shape == (3, 2)
 
 
 def test_join():
@@ -248,7 +292,6 @@ def test_file_buffer():
     f.write(b"1,2,3,4,5,6\n7,8,9,10,11,12")
     f.seek(0)
     df = DataFrame.read_csv(f, has_headers=False)
-    print(df)
     assert df.shape == (2, 6)
     f.seek(0)
 
@@ -346,7 +389,6 @@ def test_to_pandas():
     # test shifted df
     df.shift(2).to_pandas()
     df = DataFrame({"col": Series([True, False, True])})
-    print(df)
     df.shift(2).to_pandas()
 
 
@@ -374,3 +416,173 @@ def test_from_pandas_datetime():
     df = pd.DataFrame({"datetime": ["2021-01-01", "2021-01-02"], "foo": [1, 2]})
     df["datetime"] = pd.to_datetime(df["datetime"])
     pl.from_pandas(df)
+
+
+def test_df_fold():
+    df = pl.DataFrame({"a": [2, 1, 3], "b": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
+
+    assert df.fold(lambda s1, s2: s1 + s2).series_equal(Series("a", [4.0, 5.0, 9.0]))
+    assert df.fold(lambda s1, s2: s1.zip_with(s1 < s2, s2)).series_equal(
+        Series("a", [1.0, 1.0, 3.0])
+    )
+
+    df = pl.DataFrame({"a": ["foo", "bar", "2"], "b": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
+    out = df.fold(lambda s1, s2: s1 + s2)
+    out.series_equal(Series("", ["foo11", "bar22", "233"]))
+
+    df = pl.DataFrame({"a": [3, 2, 1], "b": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
+    # just check dispatch. values are tested on rust side.
+    assert df.sum(axis=1).shape == (3, 1)
+    assert df.mean(axis=1).shape == (3, 1)
+    assert df.min(axis=1).shape == (3, 1)
+    assert df.max(axis=1).shape == (3, 1)
+
+
+def test_row_tuple():
+    df = pl.DataFrame({"a": ["foo", "bar", "2"], "b": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
+    assert df.row(0) == ("foo", 1, 1.0)
+    assert df.row(1) == ("bar", 2, 2.0)
+    assert df.row(-1) == ("2", 3, 3.0)
+
+
+def test_read_csv_categorical():
+    f = BytesIO()
+    f.write(b"col1,col2,col3,col4,col5,col6\n'foo',2,3,4,5,6\n'bar',8,9,10,11,12")
+    f.seek(0)
+    df = pl.DataFrame.read_csv(f, has_headers=True, dtype={"col1": pl.Categorical})
+    assert df["col1"].dtype == pl.Categorical
+
+
+def test_df_apply():
+    df = pl.DataFrame({"a": ["foo", "bar", "2"], "b": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
+    out = df.apply(lambda x: len(x), None)
+    assert out.sum() == 9
+
+
+def test_column_names():
+    tbl = pa.table(
+        {
+            "a": pa.array([1, 2, 3, 4, 5], pa.decimal128(38, 2)),
+            "b": pa.array([1, 2, 3, 4, 5], pa.int64()),
+        }
+    )
+    df = pl.from_arrow(tbl)
+    assert df.columns == ["a", "b"]
+
+
+def test_lazy_functions():
+    df = pl.DataFrame({"a": ["foo", "bar", "2"], "b": [1, 2, 3], "c": [1.0, 2.0, 3.0]})
+    out = df[[pl.count("a")]]
+    assert out[0] == 3
+    assert pl.count(df["a"]) == 3
+    out = df[
+        [
+            pl.var("b"),
+            pl.std("b"),
+            pl.max("b"),
+            pl.min("b"),
+            pl.sum("b"),
+            pl.mean("b"),
+            pl.median("b"),
+            pl.n_unique("b"),
+            pl.first("b"),
+            pl.last("b"),
+        ]
+    ]
+    expected = 1.0
+    assert np.isclose(out[0], expected)
+    assert np.isclose(pl.var(df["b"]), expected)
+    expected = 1.0
+    assert np.isclose(out[1], expected)
+    assert np.isclose(pl.std(df["b"]), expected)
+    expected = 3
+    assert np.isclose(out[2], expected)
+    assert np.isclose(pl.max(df["b"]), expected)
+    expected = 1
+    assert np.isclose(out[3], expected)
+    assert np.isclose(pl.min(df["b"]), expected)
+    expected = 6
+    assert np.isclose(out[4], expected)
+    assert np.isclose(pl.sum(df["b"]), expected)
+    expected = 2
+    assert np.isclose(out[5], expected)
+    assert np.isclose(pl.mean(df["b"]), expected)
+    expected = 2
+    assert np.isclose(out[6], expected)
+    assert np.isclose(pl.median(df["b"]), expected)
+    expected = 3
+    assert np.isclose(out[7], expected)
+    assert np.isclose(pl.n_unique(df["b"]), expected)
+    expected = 1
+    assert np.isclose(out[8], expected)
+    assert np.isclose(pl.first(df["b"]), expected)
+    expected = 3
+    assert np.isclose(out[9], expected)
+    assert np.isclose(pl.last(df["b"]), expected)
+    expected = 3
+    assert np.isclose(out[9], expected)
+    assert np.isclose(pl.last(df["b"]), expected)
+
+
+def test_multiple_column_sort():
+    df = pl.DataFrame({"a": ["foo", "bar", "2"], "b": [2, 2, 3], "c": [1.0, 2.0, 3.0]})
+    out = df.sort([col("b"), col("c").reverse()])
+    assert out["c"] == [2, 3, 1]
+    assert out["b"] == [2, 2, 3]
+
+    df = pl.DataFrame({"a": np.arange(1, 4), "b": ["a", "a", "b"]})
+
+    df.sort("a", reverse=True).frame_equal(
+        pl.DataFrame({"a": [3, 2, 1], "b": ["b", "a", "a"]})
+    )
+
+    df.sort("b", reverse=True).frame_equal(
+        pl.DataFrame({"a": [3, 1, 2], "b": ["b", "a", "a"]})
+    )
+
+    df.sort(["b", "a"], reverse=[False, True]).frame_equal(
+        pl.DataFrame({"a": [2, 1, 3], "b": ["a", "a", "b"]})
+    )
+
+
+def test_describe():
+    df = pl.DataFrame(
+        {
+            "a": [1.0, 2.8, 3.0],
+            "b": [4, 5, 6],
+            "c": [True, False, True],
+            "d": ["a", "b", "c"],
+        }
+    )
+    assert df.describe().shape != df.shape
+    assert set(df.describe()[2]) == set([1.0, 4.0, 5.0, 6.0])
+
+
+def test_string_cache_eager_lazy():
+    # tests if the global string cache is really global and not interfered by the lazy execution.
+    # first the global settings was thread-local and this breaks with the parallel execution of lazy
+    with pl.StringCache():
+        df1 = pl.DataFrame(
+            {"region_ids": ["reg1", "reg2", "reg3", "reg4", "reg5"]}
+        ).select([pl.col("region_ids").cast(pl.Categorical)])
+        df2 = pl.DataFrame(
+            {"seq_name": ["reg4", "reg2", "reg1"], "score": [3.0, 1.0, 2.0]}
+        ).select([pl.col("seq_name").cast(pl.Categorical), pl.col("score")])
+
+    expected = pl.DataFrame(
+        {
+            "region_ids": ["reg1", "reg2", "reg3", "reg4", "reg5"],
+            "score": [2.0, 1.0, None, 3.0, None],
+        }
+    )
+    assert df1.join(
+        df2, left_on="region_ids", right_on="seq_name", how="left"
+    ).frame_equal(expected, null_equal=True)
+
+
+def test_assign():
+    # check if can assign in case of a single column
+    df = pl.DataFrame({"a": [1, 2, 3]})
+    # test if we can assign in case of single column
+    df["a"] = df["a"] * 2
+    assert df["a"] == [2, 4, 6]

@@ -1,6 +1,6 @@
 [package]
 name = "polars-core"
-version = "0.12.0"
+version = "0.13.3"
 authors = ["ritchie46 <ritchie46@gmail.com>"]
 edition = "2018"
 license = "MIT"
@@ -11,23 +11,40 @@ repository = "https://github.com/ritchie46/polars"
 
 [features]
 simd = ["arrow/simd"]
+avx512 = ["arrow/avx512"]
 docs = []
 temporal = ["chrono", "regex"]
 random = ["rand", "rand_distr"]
-default = ["docs", "temporal", "lazy", "parquet", "performant", "plain_fmt"]
-lazy = []
+default = ["docs", "temporal", "performant"]
+lazy = ["sort_multiple"]
+
 # commented out until UB is fixed
 #parallel = []
+
+# ~40% faster collect, needed until trustedlength iter stabilizes
 performant = []
+
 # extra utilities for Utf8Chunked
 strings = ["regex"]
+
 # support for ObjectChunked<T> (downcastable Series of any type)
 object = ["serde_json"]
+
 # Cannot have mutually exclusive types. User should choose one of:
 pretty_fmt = ["comfy-table"]
 plain_fmt = ["prettytable-rs"]
 
-# opt-in datatypes
+# opt-in features
+# pivot operation on DataFrame
+pivot = []
+# resample operation on DataFrame
+downsample = ["temporal", "dtype-date64"]
+# sort by multiple columns
+sort_multiple = []
+# is_in operation
+is_in = []
+
+# opt-in datatypes for Series
 dtype-time64-ns = []
 dtype-duration-ns = []
 dtype-duration-ms = []
@@ -35,12 +52,15 @@ dtype-date32 = []
 dtype-date64 = []
 dtype-i8 = []
 dtype-i16 = []
+dtype-u8 = []
+dtype-u16 = []
+dtype-u64 = []
 
 [dependencies]
-arrow = {version="4.0.0-SNAPSHOT", git = "https://github.com/apache/arrow", rev = "f7b143959ec77a79a3e11bcb83e24eaf0d03697c", default-features=false}
-parquet = {version = "4.0.0-SNAPSHOT", optional = true, git = "https://github.com/apache/arrow", rev = "f7b143959ec77a79a3e11bcb83e24eaf0d03697c"}
+arrow = {version="4.0.0-SNAPSHOT", git = "https://github.com/apache/arrow-rs", rev = "d008f31b107c1030a1f5144c164e8ca8bf543576", default-features=false}
+parquet = {version = "4.0.0-SNAPSHOT", optional = true, git = "https://github.com/apache/arrow-rs", rev = "d008f31b107c1030a1f5144c164e8ca8bf543576"}
 thiserror = "^1.0.16"
-num = "^0.3.1"
+num = "^0.4"
 itertools = "0.10"
 unsafe_unwrap = "^0.1.0"
 rayon = "1.5"
@@ -56,8 +76,8 @@ anyhow = "1.0"
 ahash = "0.7"
 num_cpus = "1.13"
 lazy_static = "1.4"
-hashbrown = {version = "0.9.1", features = ["rayon"] }
-polars-arrow = {version = "0.12.0", path = "../polars-arrow"}
+hashbrown = {version = "0.11", features = ["rayon"] }
+polars-arrow = {version = "0.13.3", path = "../polars-arrow"}
 
 [package.metadata.docs.rs]
 all-features = true

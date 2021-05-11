@@ -63,7 +63,7 @@ fn split_acc_projections(
 }
 
 /// utility function such that we can recurse all binary expressions in the expression tree
-fn add_to_accumulated(
+fn add_expr_to_accumulated(
     expr: Node,
     acc_projections: &mut Vec<Node>,
     projected_names: &mut HashSet<Arc<String>, RandomState>,
@@ -75,6 +75,19 @@ fn add_to_accumulated(
                 acc_projections.push(root_node)
             }
         }
+    }
+}
+
+fn add_str_to_accumulated(
+    name: &str,
+    acc_projections: &mut Vec<Node>,
+    projected_names: &mut HashSet<Arc<String>, RandomState>,
+    expr_arena: &mut Arena<AExpr>,
+) {
+    // if empty: all columns are already projected.
+    if !acc_projections.is_empty() {
+        let node = expr_arena.add(AExpr::Column(Arc::new(name.to_string())));
+        add_expr_to_accumulated(node, acc_projections, projected_names, expr_arena);
     }
 }
 
@@ -165,7 +178,7 @@ impl ProjectionPushDown {
         &self,
         logical_plan: ALogicalPlan,
         mut acc_projections: Vec<Node>,
-        mut names: HashSet<Arc<String>, RandomState>,
+        mut projected_names: HashSet<Arc<String>, RandomState>,
         projections_seen: usize,
         lp_arena: &mut Arena<ALogicalPlan>,
         expr_arena: &mut Arena<AExpr>,
@@ -173,18 +186,6 @@ impl ProjectionPushDown {
         use ALogicalPlan::*;
 
         match logical_plan {
-            Slice { input, offset, len } => {
-                self.pushdown_and_assign(
-                    input,
-                    acc_projections,
-                    names,
-                    projections_seen,
-                    lp_arena,
-                    expr_arena,
-                )?;
-                Ok(Slice { input, offset, len })
-            }
-
             Projection { expr, input, .. } => {
                 // A projection can consist of a chain of expressions followed by an alias.
                 // We want to do the chain locally because it can have complicated side effects.
@@ -201,7 +202,7 @@ impl ProjectionPushDown {
                     // In this query, bar cannot pass this projection, as it would not exist in DF.
                     if !acc_projections.is_empty() {
                         if let AExpr::Alias(_, name) = expr_arena.get(*e) {
-                            if names.remove(name) {
+                            if projected_names.remove(name) {
                                 acc_projections = acc_projections
                                     .into_iter()
                                     .filter(|expr| {
@@ -212,13 +213,18 @@ impl ProjectionPushDown {
                         }
                     }
 
-                    add_to_accumulated(*e, &mut acc_projections, &mut names, expr_arena);
+                    add_expr_to_accumulated(
+                        *e,
+                        &mut acc_projections,
+                        &mut projected_names,
+                        expr_arena,
+                    );
                 }
 
                 self.pushdown_and_assign(
                     input,
                     acc_projections,
-                    names,
+                    projected_names,
                     projections_seen,
                     lp_arena,
                     expr_arena,
@@ -230,24 +236,20 @@ impl ProjectionPushDown {
                 // the projections should all be done at the latest projection node to keep the same schema order
                 if projections_seen == 0 {
                     for expr in expr {
-                        // TODO! maybe we can remove this check?
-                        // We check if we still can the projection here.
+                        // Due to the pushdown, a lot of projections cannot be done anymore at the final
+                        // node and should be skipped
                         if expr_arena
                             .get(expr)
-                            .to_field(lp.schema(lp_arena), Context::Other, expr_arena)
+                            .to_field(lp.schema(lp_arena), Context::Default, expr_arena)
                             .is_ok()
                         {
                             local_projection.push(expr);
                         }
                     }
-                    // only aliases should be projected locally
+                    // only aliases should be projected locally in the rest of the projections.
                 } else {
                     for expr in expr {
-                        if has_aexpr(
-                            expr,
-                            expr_arena,
-                            &AExpr::Alias(Default::default(), Arc::new("".into())),
-                        ) {
+                        if has_aexpr(expr, expr_arena, |e| matches!(e, AExpr::Alias(_, _))) {
                             local_projection.push(expr)
                         }
                     }
@@ -260,7 +262,7 @@ impl ProjectionPushDown {
                 self.pushdown_and_assign(
                     input,
                     acc_projections,
-                    names,
+                    projected_names,
                     projections_seen,
                     lp_arena,
                     expr_arena,
@@ -328,6 +330,7 @@ impl ProjectionPushDown {
                 predicate,
                 aggregate,
                 cache,
+                low_memory,
                 ..
             } => {
                 let with_columns = get_scan_columns(&mut acc_projections, expr_arena);
@@ -343,6 +346,7 @@ impl ProjectionPushDown {
                     predicate,
                     aggregate,
                     cache,
+                    low_memory,
                 };
                 Ok(lp)
             }
@@ -352,15 +356,25 @@ impl ProjectionPushDown {
                 reverse,
             } => {
                 if !acc_projections.is_empty() {
-                    // Make sure that the column used for the sort is projected
-                    let node = expr_arena.add(AExpr::Column(Arc::new(by_column.clone())));
-                    add_to_accumulated(node, &mut acc_projections, &mut names, expr_arena);
+                    // Make sure that the column(s) used for the sort is projected
+                    by_column.iter().for_each(|node| {
+                        aexpr_to_root_nodes(*node, expr_arena)
+                            .iter()
+                            .for_each(|root| {
+                                add_expr_to_accumulated(
+                                    *root,
+                                    &mut acc_projections,
+                                    &mut projected_names,
+                                    expr_arena,
+                                );
+                            })
+                    });
                 }
 
                 self.pushdown_and_assign(
                     input,
                     acc_projections,
-                    names,
+                    projected_names,
                     projections_seen,
                     lp_arena,
                     expr_arena,
@@ -372,33 +386,23 @@ impl ProjectionPushDown {
                 })
             }
             Explode { input, columns } => {
-                if !acc_projections.is_empty() {
-                    // Make sure that the exploded columns are projected.
-                    for column in &columns {
-                        let node = expr_arena.add(AExpr::Column(Arc::new(column.clone())));
-                        add_to_accumulated(node, &mut acc_projections, &mut names, expr_arena);
-                    }
-                }
+                columns.iter().for_each(|name| {
+                    add_str_to_accumulated(
+                        name,
+                        &mut acc_projections,
+                        &mut projected_names,
+                        expr_arena,
+                    )
+                });
                 self.pushdown_and_assign(
                     input,
                     acc_projections,
-                    names,
+                    projected_names,
                     projections_seen,
                     lp_arena,
                     expr_arena,
                 )?;
                 Ok(Explode { input, columns })
-            }
-            Cache { input } => {
-                self.pushdown_and_assign(
-                    input,
-                    acc_projections,
-                    names,
-                    projections_seen,
-                    lp_arena,
-                    expr_arena,
-                )?;
-                Ok(Cache { input })
             }
             Distinct {
                 input,
@@ -406,18 +410,21 @@ impl ProjectionPushDown {
                 subset,
             } => {
                 // make sure that the set of unique columns is projected
-                if let Some(subset) = subset.as_ref() {
-                    if !acc_projections.is_empty() {
-                        for name in subset {
-                            let node = expr_arena.add(AExpr::Column(Arc::new(name.clone())));
-                            add_to_accumulated(node, &mut acc_projections, &mut names, expr_arena);
-                        }
-                    }
-                };
+                if let Some(subset) = (&*subset).as_ref() {
+                    subset.iter().for_each(|name| {
+                        add_str_to_accumulated(
+                            name,
+                            &mut acc_projections,
+                            &mut projected_names,
+                            expr_arena,
+                        )
+                    })
+                }
+
                 self.pushdown_and_assign(
                     input,
                     acc_projections,
-                    names,
+                    projected_names,
                     projections_seen,
                     lp_arena,
                     expr_arena,
@@ -431,12 +438,17 @@ impl ProjectionPushDown {
             Selection { predicate, input } => {
                 if !acc_projections.is_empty() {
                     // make sure that the filter column is projected
-                    add_to_accumulated(predicate, &mut acc_projections, &mut names, expr_arena);
+                    add_expr_to_accumulated(
+                        predicate,
+                        &mut acc_projections,
+                        &mut projected_names,
+                        expr_arena,
+                    );
                 };
                 self.pushdown_and_assign(
                     input,
                     acc_projections,
-                    names,
+                    projected_names,
                     projections_seen,
                     lp_arena,
                     expr_arena,
@@ -460,16 +472,22 @@ impl ProjectionPushDown {
                 }
 
                 // make sure that the requested columns are projected
-                if !acc_projections.is_empty() {
-                    for name in id_vars.iter() {
-                        let node = expr_arena.add(AExpr::Column(Arc::new(name.clone())));
-                        acc_projections.push(node);
-                    }
-                    for name in value_vars.iter() {
-                        let node = expr_arena.add(AExpr::Column(Arc::new(name.clone())));
-                        acc_projections.push(node);
-                    }
-                }
+                id_vars.iter().for_each(|name| {
+                    add_str_to_accumulated(
+                        name,
+                        &mut acc_projections,
+                        &mut projected_names,
+                        expr_arena,
+                    )
+                });
+                value_vars.iter().for_each(|name| {
+                    add_str_to_accumulated(
+                        name,
+                        &mut acc_projections,
+                        &mut projected_names,
+                        expr_arena,
+                    )
+                });
 
                 self.pushdown_and_assign(
                     input,
@@ -515,12 +533,12 @@ impl ProjectionPushDown {
 
                     // add the columns used in the aggregations to the projection
                     for agg in &aggs {
-                        add_to_accumulated(*agg, &mut acc_projections, &mut names, expr_arena);
+                        add_expr_to_accumulated(*agg, &mut acc_projections, &mut names, expr_arena);
                     }
 
                     // make sure the keys are projected
                     for key in &*keys {
-                        add_to_accumulated(*key, &mut acc_projections, &mut names, expr_arena);
+                        add_expr_to_accumulated(*key, &mut acc_projections, &mut names, expr_arena);
                     }
 
                     self.pushdown_and_assign(
@@ -662,10 +680,10 @@ impl ProjectionPushDown {
                 // only if not empty. If empty we already select everything.
                 if !acc_projections.is_empty() {
                     for expression in &exprs {
-                        add_to_accumulated(
+                        add_expr_to_accumulated(
                             *expression,
                             &mut acc_projections,
-                            &mut names,
+                            &mut projected_names,
                             expr_arena,
                         );
                     }
@@ -690,7 +708,6 @@ impl ProjectionPushDown {
                     .build();
                 Ok(lp)
             }
-
             Udf {
                 input,
                 function,
@@ -702,7 +719,7 @@ impl ProjectionPushDown {
                     self.pushdown_and_assign(
                         input,
                         acc_projections,
-                        names,
+                        projected_names,
                         projections_seen,
                         lp_arena,
                         expr_arena,
@@ -715,6 +732,44 @@ impl ProjectionPushDown {
                     projection_pd,
                     schema,
                 })
+            }
+            lp @ Slice { .. } | lp @ Cache { .. } => {
+                let inputs = lp.get_inputs();
+                let exprs = lp.get_exprs();
+
+                let new_inputs = if inputs.len() == 1 {
+                    let node = inputs[0];
+                    let alp = lp_arena.take(node);
+                    let alp = self.push_down(
+                        alp,
+                        acc_projections,
+                        projected_names,
+                        projections_seen,
+                        lp_arena,
+                        expr_arena,
+                    )?;
+                    lp_arena.replace(node, alp);
+                    vec![node]
+                } else {
+                    inputs
+                        .iter()
+                        .map(|&node| {
+                            let alp = lp_arena.take(node);
+                            let alp = self.push_down(
+                                alp,
+                                acc_projections.clone(),
+                                projected_names.clone(),
+                                projections_seen,
+                                lp_arena,
+                                expr_arena,
+                            )?;
+                            lp_arena.replace(node, alp);
+                            Ok(node)
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
+
+                Ok(lp.from_exprs_and_input(exprs, new_inputs))
             }
         }
     }

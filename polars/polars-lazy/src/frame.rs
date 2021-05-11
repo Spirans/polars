@@ -1,23 +1,26 @@
 //! Lazy variant of a [DataFrame](polars_core::frame::DataFrame).
-use crate::logical_plan::optimizer::aggregate_pushdown::AggregatePushdown;
-use crate::logical_plan::optimizer::simplify_expr::SimplifyExprRule;
-use crate::prelude::simplify_expr::SimplifyBooleanRule;
-use crate::utils::combine_predicates_expr;
-use crate::{logical_plan::FETCH_ROWS, prelude::*};
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use ahash::RandomState;
+
 use polars_core::frame::hash_join::JoinType;
 use polars_core::prelude::*;
 use polars_core::toggle_string_cache;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::Mutex;
 
+use crate::logical_plan::optimizer::aggregate_pushdown::AggregatePushdown;
 use crate::logical_plan::optimizer::aggregate_scan_projections::AggScanProjection;
+use crate::logical_plan::optimizer::simplify_expr::SimplifyExprRule;
+use crate::logical_plan::optimizer::stack_opt::{OptimizationRule, StackOptimizer};
 use crate::logical_plan::optimizer::{
     predicate_pushdown::PredicatePushDown, projection_pushdown::ProjectionPushDown,
 };
+use crate::physical_plan::state::ExecutionState;
 use crate::prelude::aggregate_scan_projections::agg_projection;
-use itertools::Itertools;
+use crate::prelude::join_pruning::JoinPrune;
+use crate::prelude::simplify_expr::SimplifyBooleanRule;
+use crate::utils::combine_predicates_expr;
+use crate::{logical_plan::FETCH_ROWS, prelude::*};
 
 #[derive(Clone)]
 pub struct LazyCsvReader<'a> {
@@ -30,6 +33,7 @@ pub struct LazyCsvReader<'a> {
     cache: bool,
     schema: Option<SchemaRef>,
     schema_overwrite: Option<&'a Schema>,
+    low_memory: bool,
 }
 
 impl<'a> LazyCsvReader<'a> {
@@ -44,6 +48,7 @@ impl<'a> LazyCsvReader<'a> {
             cache: true,
             schema: None,
             schema_overwrite: None,
+            low_memory: false,
         }
     }
 
@@ -97,6 +102,12 @@ impl<'a> LazyCsvReader<'a> {
         self
     }
 
+    /// Reduce memory usage in expensive of performance
+    pub fn low_memory(mut self, toggle: bool) -> Self {
+        self.low_memory = toggle;
+        self
+    }
+
     pub fn finish(self) -> LazyFrame {
         let mut lf: LazyFrame = LogicalPlanBuilder::scan_csv(
             self.path,
@@ -108,6 +119,7 @@ impl<'a> LazyCsvReader<'a> {
             self.cache,
             self.schema,
             self.schema_overwrite,
+            self.low_memory,
         )
         .build()
         .into();
@@ -148,7 +160,7 @@ impl IntoLazy for DataFrame {
 #[derive(Clone)]
 pub struct LazyFrame {
     pub(crate) logical_plan: LogicalPlan,
-    opt_state: OptState,
+    pub(crate) opt_state: OptState,
 }
 
 impl Default for LazyFrame {
@@ -176,9 +188,11 @@ pub struct OptState {
     pub predicate_pushdown: bool,
     pub type_coercion: bool,
     pub simplify_expr: bool,
+    /// Make sure that all needed columns are scannedn
     pub agg_scan_projection: bool,
     pub aggregate_pushdown: bool,
     pub global_string_cache: bool,
+    pub join_pruning: bool,
 }
 
 impl Default for OptState {
@@ -188,9 +202,11 @@ impl Default for OptState {
             predicate_pushdown: true,
             type_coercion: true,
             simplify_expr: true,
+            global_string_cache: true,
+            join_pruning: true,
+            // will be toggled by a scan operation such as csv scan or parquet scan
             agg_scan_projection: false,
             aggregate_pushdown: false,
-            global_string_cache: true,
         }
     }
 }
@@ -216,14 +232,14 @@ impl LazyFrame {
         let mut logical_plan = self.clone().get_plan_builder().build();
         if optimized {
             // initialize arena's
-            let mut expr_arena = Arena::with_capacity(512);
-            let mut lp_arena = Arena::with_capacity(512);
+            let mut expr_arena = Arena::with_capacity(64);
+            let mut lp_arena = Arena::with_capacity(32);
 
             let lp_top = self.clone().optimize(&mut lp_arena, &mut expr_arena)?;
             logical_plan = node_to_lp(lp_top, &mut expr_arena, &mut lp_arena);
         }
 
-        logical_plan.dot(&mut s, 0, "").expect("io error");
+        logical_plan.dot(&mut s, (0, 0), "").expect("io error");
         s.push_str("\n}");
         Ok(s)
     }
@@ -241,6 +257,14 @@ impl LazyFrame {
             logical_plan,
             opt_state,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_alp(self) -> (Node, Arena<AExpr>, Arena<ALogicalPlan>) {
+        let mut expr_arena = Arena::with_capacity(64);
+        let mut lp_arena = Arena::with_capacity(32);
+        let root = to_alp(self.logical_plan, &mut expr_arena, &mut lp_arena);
+        (root, expr_arena, lp_arena)
     }
 
     /// Toggle projection pushdown optimization.
@@ -279,6 +303,12 @@ impl LazyFrame {
         self
     }
 
+    /// Toggle join pruning optimization
+    pub fn with_join_pruning(mut self, toggle: bool) -> Self {
+        self.opt_state.join_pruning = toggle;
+        self
+    }
+
     /// Describe the logical plan.
     pub fn describe_plan(&self) -> String {
         self.logical_plan.describe()
@@ -311,8 +341,28 @@ impl LazyFrame {
         let opt_state = self.get_opt_state();
         let lp = self
             .get_plan_builder()
-            .sort(by_column.into(), reverse)
+            .sort(vec![col(by_column)], vec![reverse])
             .build();
+        Self::from_logical_plan(lp, opt_state)
+    }
+
+    /// Add a sort operation to the logical plan.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use polars_core::prelude::*;
+    /// use polars_lazy::prelude::*;
+    ///
+    /// /// Sort DataFrame by 'sepal.width' column
+    /// fn example(df: DataFrame) -> LazyFrame {
+    ///       df.lazy()
+    ///         .sort_by_exprs(vec![col("sepal.width")], vec![false])
+    /// }
+    /// ```
+    pub fn sort_by_exprs(self, by_exprs: Vec<Expr>, reverse: Vec<bool>) -> Self {
+        let opt_state = self.get_opt_state();
+        let lp = self.get_plan_builder().sort(by_exprs, reverse).build();
         Self::from_logical_plan(lp, opt_state)
     }
 
@@ -396,7 +446,7 @@ impl LazyFrame {
         res
     }
 
-    fn optimize(
+    pub fn optimize(
         self,
         lp_arena: &mut Arena<ALogicalPlan>,
         expr_arena: &mut Arena<AExpr>,
@@ -406,8 +456,10 @@ impl LazyFrame {
         let projection_pushdown = self.opt_state.projection_pushdown;
         let type_coercion = self.opt_state.type_coercion;
         let simplify_expr = self.opt_state.simplify_expr;
-        let agg_scan_projection = self.opt_state.agg_scan_projection;
+
+        let mut agg_scan_projection = self.opt_state.agg_scan_projection;
         let aggregate_pushdown = self.opt_state.aggregate_pushdown;
+        let join_pruning = self.opt_state.join_pruning;
 
         let logical_plan = self.get_plan_builder().build();
 
@@ -447,9 +499,12 @@ impl LazyFrame {
             rules.push(Box::new(SimplifyExprRule {}));
             rules.push(Box::new(SimplifyBooleanRule {}));
         }
-
         if aggregate_pushdown {
             rules.push(Box::new(AggregatePushdown::new()))
+        }
+        if join_pruning {
+            rules.push(Box::new(JoinPrune {}));
+            agg_scan_projection = true;
         }
 
         if agg_scan_projection {
@@ -470,14 +525,18 @@ impl LazyFrame {
         {
             // only check by names because we may supercast types.
             assert_eq!(
-                prev_schema.fields().iter().map(|f| f.name()).collect_vec(),
+                prev_schema
+                    .fields()
+                    .iter()
+                    .map(|f| f.name())
+                    .collect::<Vec<_>>(),
                 lp_arena
                     .get(lp_top)
                     .schema(lp_arena)
                     .fields()
                     .iter()
                     .map(|f| f.name())
-                    .collect_vec()
+                    .collect::<Vec<_>>()
             );
         };
 
@@ -503,19 +562,20 @@ impl LazyFrame {
     /// ```
     pub fn collect(self) -> Result<DataFrame> {
         let use_string_cache = self.opt_state.global_string_cache;
-        let mut expr_arena = Arena::with_capacity(512);
-        let mut lp_arena = Arena::with_capacity(512);
+        let mut expr_arena = Arena::with_capacity(256);
+        let mut lp_arena = Arena::with_capacity(128);
         let lp_top = self.optimize(&mut lp_arena, &mut expr_arena)?;
 
-        toggle_string_cache(use_string_cache);
+        // if string cache was already set, we skip this and global settings are respected
+        if use_string_cache {
+            toggle_string_cache(use_string_cache);
+        }
         let planner = DefaultPlanner::default();
         let mut physical_plan =
             planner.create_physical_plan(lp_top, &mut lp_arena, &mut expr_arena)?;
-        let cache = Arc::new(Mutex::new(HashMap::with_capacity_and_hasher(
-            64,
-            RandomState::default(),
-        )));
-        let out = physical_plan.execute(&cache);
+
+        let state = ExecutionState::new();
+        let out = physical_plan.execute(&state);
         if use_string_cache {
             toggle_string_cache(!use_string_cache);
         }
@@ -860,7 +920,7 @@ impl LazyFrame {
     }
 
     /// Slice the DataFrame.
-    pub fn slice(self, offset: usize, len: usize) -> LazyFrame {
+    pub fn slice(self, offset: i64, len: usize) -> LazyFrame {
         let opt_state = self.get_opt_state();
         let lp = self.get_plan_builder().slice(offset, len).build();
         Self::from_logical_plan(lp, opt_state)
@@ -869,6 +929,17 @@ impl LazyFrame {
     /// Get the first row.
     pub fn first(self) -> LazyFrame {
         self.slice(0, 1)
+    }
+
+    /// Get the last row
+    pub fn last(self) -> LazyFrame {
+        self.slice(-1, 1)
+    }
+
+    /// Get the n last rows
+    pub fn tail(self, n: usize) -> LazyFrame {
+        let neg_tail = -(n as i64);
+        self.slice(neg_tail, n)
     }
 
     /// Melt the DataFrame from wide to long format
@@ -966,11 +1037,14 @@ impl LazyGroupBy {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use crate::functions::pearson_corr;
-    use crate::tests::get_df;
+    #[cfg(feature = "temporal")]
     use polars_core::utils::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
     use polars_core::*;
+
+    use crate::functions::pearson_corr;
+    use crate::tests::get_df;
+
+    use super::*;
 
     fn scan_foods_csv() -> LazyFrame {
         let path = "../../examples/aggregate_multiple_files_in_chunks/datasets/foods1.csv";
@@ -1144,6 +1218,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "temporal")]
     fn test_lazy_agg() {
         let s0 = Date32Chunked::parse_from_str_slice(
             "date",
@@ -1376,6 +1451,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "temporal")]
     fn test_lazy_query_7() {
         let date = NaiveDate::from_ymd(2021, 3, 5);
         let dates = vec![
@@ -1785,5 +1861,163 @@ mod test {
             .collect()
             .unwrap();
         assert_eq!(out.column("A").unwrap().null_count(), 0);
+    }
+
+    #[test]
+    fn test_lazy_groupby() {
+        let df = df! {
+            "a" => &[Some(1.0), None, Some(3.0), Some(4.0), Some(5.0)],
+            "groups" => &["a", "a", "b", "c", "c"]
+        }
+        .unwrap();
+
+        let out = df
+            .lazy()
+            .groupby(vec![col("groups")])
+            .agg(vec![col("a").mean()])
+            .sort("a_mean", false)
+            .collect()
+            .unwrap();
+
+        assert_eq!(
+            out.column("a_mean").unwrap().f64().unwrap().get(0),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn test_lazy_tail() {
+        let df = df! {
+            "A" => &[1, 2, 3, 4, 5],
+            "B" => &[5, 4, 3, 2, 1]
+        }
+        .unwrap();
+
+        let _out = df.clone().lazy().tail(3).collect().unwrap();
+    }
+
+    #[test]
+    fn test_lazy_groupby_sort() {
+        let df = df! {
+            "a" => ["a", "b", "a", "b", "b", "c"],
+            "b" => [1, 2, 3, 4, 5, 6]
+        }
+        .unwrap();
+
+        let out = df
+            .clone()
+            .lazy()
+            .groupby(vec![col("a")])
+            .agg(vec![col("b").sort(false).first()])
+            .collect()
+            .unwrap()
+            .sort("a", false)
+            .unwrap();
+
+        assert_eq!(
+            Vec::from(out.column("b_first").unwrap().i32().unwrap()),
+            [Some(1), Some(2), Some(6)]
+        );
+
+        let out = df
+            .lazy()
+            .groupby(vec![col("a")])
+            .agg(vec![col("b").sort(false).last()])
+            .collect()
+            .unwrap()
+            .sort("a", false)
+            .unwrap();
+
+        assert_eq!(
+            Vec::from(out.column("b_last").unwrap().i32().unwrap()),
+            [Some(3), Some(5), Some(6)]
+        );
+    }
+
+    #[test]
+    fn test_lazy_groupby_sort_by() {
+        let df = df! {
+            "a" => ["a", "a", "a", "b", "b", "c"],
+            "b" => [1, 2, 3, 4, 5, 6],
+            "c" => [6, 1, 4, 3, 2, 1]
+        }
+        .unwrap();
+
+        let out = df
+            .lazy()
+            .groupby(vec![col("a")])
+            .agg(vec![col("b").sort_by(col("c"), true).first()])
+            .collect()
+            .unwrap()
+            .sort("a", false)
+            .unwrap();
+
+        assert_eq!(
+            Vec::from(out.column("b_first").unwrap().i32().unwrap()),
+            [Some(1), Some(4), Some(6)]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dtype-date64")]
+    fn test_lazy_groupby_cast() {
+        let df = df! {
+            "a" => ["a", "a", "a", "b", "b", "c"],
+            "b" => [1, 2, 3, 4, 5, 6]
+        }
+        .unwrap();
+
+        // test if it runs in groupby context
+        let _out = df
+            .lazy()
+            .groupby(vec![col("a")])
+            .agg(vec![col("b").mean().cast(DataType::Date64)])
+            .collect()
+            .unwrap();
+    }
+
+    #[test]
+    fn test_lazy_groupby_binary_expr() {
+        let df = df! {
+            "a" => ["a", "a", "a", "b", "b", "c"],
+            "b" => [1, 2, 3, 4, 5, 6]
+        }
+        .unwrap();
+
+        // test if it runs in groupby context
+        let out = df
+            .lazy()
+            .groupby(vec![col("a")])
+            .agg(vec![col("b").mean() * lit(2)])
+            .sort("a", false)
+            .collect()
+            .unwrap();
+        assert_eq!(
+            Vec::from(out.column("b_mean").unwrap().f64().unwrap()),
+            [Some(4.0), Some(9.0), Some(12.0)]
+        );
+    }
+
+    #[test]
+    fn test_lazy_groupby_filter() {
+        let df = df! {
+            "a" => ["a", "a", "a", "b", "b", "c"],
+            "b" => [1, 2, 3, 4, 5, 6]
+        }
+        .unwrap();
+
+        // test if it runs in groupby context
+        let out = df
+            .lazy()
+            .groupby(vec![col("a")])
+            .agg(vec![col("b").filter(col("a").eq(lit("a"))).sum()])
+            .sort("a", false)
+            .collect()
+            .unwrap();
+
+        assert_eq!(
+            Vec::from(out.column("b_sum").unwrap().i32().unwrap()),
+            [Some(6), Some(0), Some(0)]
+        );
     }
 }

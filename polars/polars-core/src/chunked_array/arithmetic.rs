@@ -2,8 +2,9 @@
 use crate::prelude::*;
 use crate::utils::{align_chunks_binary, NoNull};
 use arrow::array::PrimitiveArray;
+use arrow::compute::divide_scalar;
 use arrow::{array::ArrayRef, compute};
-use num::{Num, NumCast, ToPrimitive};
+use num::{Num, NumCast, One, ToPrimitive, Zero};
 use std::ops::{Add, Div, Mul, Rem, Sub};
 use std::sync::Arc;
 
@@ -71,9 +72,8 @@ where
         (a, b) if a == b => {
             let (lhs, rhs) = align_chunks_binary(lhs, rhs);
             let chunks = lhs
-                .downcast_chunks()
-                .iter()
-                .zip(rhs.downcast_chunks())
+                .downcast_iter()
+                .zip(rhs.downcast_iter())
                 .map(|(lhs, rhs)| Arc::new(kernel(lhs, rhs).expect("output")) as ArrayRef)
                 .collect();
             lhs.copy_with_chunks(chunks)
@@ -301,15 +301,14 @@ where
 impl<T, N> Div<N> for &ChunkedArray<T>
 where
     T: PolarsNumericType,
-    T::Native: NumCast,
+    T::Native: NumCast + Div<Output = T::Native> + One + Zero + Sub<Output = T::Native>,
     N: Num + ToPrimitive,
-    T::Native: Div<Output = T::Native>,
 {
     type Output = ChunkedArray<T>;
 
     fn div(self, rhs: N) -> Self::Output {
-        let divider: T::Native = NumCast::from(rhs).unwrap();
-        self.apply(|val| val / divider)
+        let rhs: T::Native = NumCast::from(rhs).expect("could not cast");
+        self.apply_kernel(|arr| Arc::new(divide_scalar(arr, rhs).unwrap()))
     }
 }
 
@@ -340,6 +339,75 @@ where
     fn rem(self, rhs: N) -> Self::Output {
         let operand: T::Native = NumCast::from(rhs).unwrap();
         self.apply(|val| val % operand)
+    }
+}
+
+impl<T, N> Add<N> for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+    T::Native: NumCast,
+    N: Num + ToPrimitive,
+    T::Native: Add<Output = T::Native>,
+{
+    type Output = ChunkedArray<T>;
+
+    fn add(self, rhs: N) -> Self::Output {
+        (&self).add(rhs)
+    }
+}
+
+impl<T, N> Sub<N> for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+    T::Native: NumCast,
+    N: Num + ToPrimitive,
+    T::Native: Sub<Output = T::Native>,
+{
+    type Output = ChunkedArray<T>;
+
+    fn sub(self, rhs: N) -> Self::Output {
+        (&self).sub(rhs)
+    }
+}
+
+impl<T, N> Div<N> for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+    T::Native: NumCast + Div<Output = T::Native> + One + Zero + Sub<Output = T::Native>,
+    N: Num + ToPrimitive,
+{
+    type Output = ChunkedArray<T>;
+
+    fn div(self, rhs: N) -> Self::Output {
+        (&self).div(rhs)
+    }
+}
+
+impl<T, N> Mul<N> for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+    T::Native: NumCast,
+    N: Num + ToPrimitive,
+    T::Native: Mul<Output = T::Native>,
+{
+    type Output = ChunkedArray<T>;
+
+    fn mul(self, rhs: N) -> Self::Output {
+        (&self).mul(rhs)
+    }
+}
+
+impl<T, N> Rem<N> for ChunkedArray<T>
+where
+    T: PolarsNumericType,
+    T::Native: NumCast,
+    N: Num + ToPrimitive,
+    T::Native: Rem<Output = T::Native>,
+{
+    type Output = ChunkedArray<T>;
+
+    fn rem(self, rhs: N) -> Self::Output {
+        (&self).rem(rhs)
     }
 }
 

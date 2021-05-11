@@ -111,6 +111,12 @@ impl PyExpr {
     pub fn n_unique(&self) -> PyExpr {
         self.clone().inner.n_unique().into()
     }
+    pub fn arg_unique(&self) -> PyExpr {
+        self.clone().inner.arg_unique().into()
+    }
+    pub fn unique(&self) -> PyExpr {
+        self.clone().inner.unique().into()
+    }
     pub fn first(&self) -> PyExpr {
         self.clone().inner.first().into()
     }
@@ -138,6 +144,15 @@ impl PyExpr {
     pub fn sort(&self, reverse: bool) -> PyExpr {
         self.clone().inner.sort(reverse).into()
     }
+
+    pub fn take(&self, idx: PyExpr) -> PyExpr {
+        self.clone().inner.take(idx.inner).into()
+    }
+
+    pub fn sort_by(&self, by: PyExpr, reverse: bool) -> PyExpr {
+        self.clone().inner.sort_by(by.inner, reverse).into()
+    }
+
     pub fn shift(&self, periods: i64) -> PyExpr {
         self.clone().inner.shift(periods).into()
     }
@@ -148,8 +163,12 @@ impl PyExpr {
             .into()
     }
 
-    pub fn fill_none(&self, expr: PyExpr) -> PyResult<PyExpr> {
-        Ok(self.clone().inner.fill_none(expr.inner).into())
+    pub fn fill_none(&self, expr: PyExpr) -> PyExpr {
+        self.clone().inner.fill_none(expr.inner).into()
+    }
+
+    pub fn filter(&self, predicate: PyExpr) -> PyExpr {
+        self.clone().inner.filter(predicate.inner).into()
     }
     pub fn reverse(&self) -> PyExpr {
         self.clone().inner.reverse().into()
@@ -177,8 +196,13 @@ impl PyExpr {
     pub fn tail(&self, n: Option<usize>) -> PyExpr {
         self.clone().inner.tail(n).into()
     }
+
     pub fn head(&self, n: Option<usize>) -> PyExpr {
         self.clone().inner.head(n).into()
+    }
+
+    pub fn slice(&self, offset: i64, length: usize) -> PyExpr {
+        self.clone().inner.slice(offset, length).into()
     }
 
     pub fn is_duplicated(&self) -> PyExpr {
@@ -195,6 +219,9 @@ impl PyExpr {
 
     pub fn _or(&self, expr: PyExpr) -> PyExpr {
         self.clone().inner.or(expr.inner).into()
+    }
+    pub fn is_in(&self, expr: PyExpr) -> PyExpr {
+        self.clone().inner.is_in(expr.inner).into()
     }
 
     pub fn pow(&self, exponent: f64) -> PyExpr {
@@ -241,6 +268,17 @@ impl PyExpr {
         self.clone()
             .inner
             .map(function, Some(DataType::UInt32))
+            .into()
+    }
+
+    pub fn str_slice(&self, start: i64, length: Option<u64>) -> PyExpr {
+        let function = move |s: Series| {
+            let ca = s.utf8()?;
+            Ok(ca.str_slice(start, length)?.into_series())
+        };
+        self.clone()
+            .inner
+            .map(function, Some(DataType::Utf8))
             .into()
     }
 
@@ -311,60 +349,28 @@ impl PyExpr {
     }
 
     pub fn year(&self) -> PyExpr {
-        let function = move |s: Series| s.year();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.year().into()
     }
     pub fn month(&self) -> PyExpr {
-        let function = move |s: Series| s.month();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.month().into()
     }
     pub fn day(&self) -> PyExpr {
-        let function = move |s: Series| s.day();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.day().into()
     }
     pub fn ordinal_day(&self) -> PyExpr {
-        let function = move |s: Series| s.ordinal_day();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.ordinal_day().into()
     }
     pub fn hour(&self) -> PyExpr {
-        let function = move |s: Series| s.hour();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.hour().into()
     }
     pub fn minute(&self) -> PyExpr {
-        let function = move |s: Series| s.minute();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.minute().into()
     }
     pub fn second(&self) -> PyExpr {
-        let function = move |s: Series| s.second();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.second().into()
     }
     pub fn nanosecond(&self) -> PyExpr {
-        let function = move |s: Series| s.nanosecond();
-        self.clone()
-            .inner
-            .map(function, Some(DataType::UInt32))
-            .into()
+        self.clone().inner.nanosecond().into()
     }
 
     pub fn map(&self, lambda: PyObject, output_type: &PyAny) -> PyExpr {
@@ -475,9 +481,6 @@ pub fn binary_expr(l: PyExpr, op: u8, r: PyExpr) -> PyExpr {
         10 => Operator::Modulus,
         11 => Operator::And,
         12 => Operator::Or,
-        13 => Operator::Not,
-        14 => Operator::Like,
-        15 => Operator::NotLike,
         _ => panic!("not an operator"),
     };
 
@@ -548,6 +551,10 @@ pub fn lit(value: &PyAny) -> PyExpr {
                 .expect("could not transform Python string to Rust Unicode"),
         )
         .into()
+    } else if let Ok(series) = value.extract::<PySeries>() {
+        dsl::lit(series.series.clone()).into()
+    } else if value.is_none() {
+        dsl::lit(Null {}).into()
     } else {
         panic!("could not convert value {:?} as a Literal", value)
     }

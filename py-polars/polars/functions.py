@@ -1,4 +1,5 @@
 from typing import Union, TextIO, Optional, List, BinaryIO
+from io import StringIO, BytesIO
 import numpy as np
 from pathlib import Path
 from .frame import DataFrame
@@ -12,10 +13,42 @@ import builtins
 import urllib.request
 import io
 
+from typing import Dict
+from .datatypes import DataType
+from urllib.parse import (  # noqa
+    urlencode,
+    urljoin,
+    urlparse as parse_url,
+    uses_netloc,
+    uses_params,
+    uses_relative,
+)
+
+_VALID_URLS = set(uses_relative + uses_netloc + uses_params)
+_VALID_URLS.discard("")
+
 
 def _process_http_file(path: str) -> io.BytesIO:
     with urllib.request.urlopen(path) as f:
         return io.BytesIO(f.read())
+
+
+def _is_url(url: str) -> bool:
+    """Check to see if a URL has a valid protocol.
+
+    Parameters
+    ----------
+    url : str or unicode
+
+    Returns
+    -------
+    isurl : bool
+        If `url` has a valid protocol return True otherwise False.
+    """
+    try:
+        return parse_url(url).scheme in _VALID_URLS
+    except Exception:
+        return False
 
 
 def _prepare_file_arg(
@@ -28,12 +61,17 @@ def _prepare_file_arg(
         - A path.Path object is converted to a string
         - a raw file on the web is downloaded into a buffer.
     """
-    if isinstance(file, Path):
-        file = str(file)
+    if _is_url(file):
+        if isinstance(file, Path):
+            file = str(file)
 
-    if isinstance(file, str) and file.startswith("http"):
-        file = _process_http_file(file)
-
+        if isinstance(file, str) and file.startswith("http"):
+            file = _process_http_file(file)
+    else:
+        if isinstance(file, StringIO):
+            return io.BytesIO(file.read().encode("utf8"))
+        elif isinstance(file, BytesIO):
+            return file
     return file
 
 
@@ -44,7 +82,7 @@ def get_dummies(df: DataFrame) -> DataFrame:
 def read_csv(
     file: Union[str, TextIO, Path],
     infer_schema_length: int = 100,
-    batch_size: int = 64,
+    batch_size: int = 8192,
     has_headers: bool = True,
     ignore_errors: bool = False,
     stop_after_n_rows: Optional[int] = None,
@@ -58,6 +96,7 @@ def read_csv(
     dtype: "Optional[Dict[str, DataType]]" = None,
     new_columns: "Optional[List[str]]" = None,
     use_pyarrow: bool = True,
+    low_memory: bool = False,
 ) -> "DataFrame":
     """
     Read into a DataFrame from a csv file.
@@ -66,6 +105,9 @@ def read_csv(
     ----------
     file
         Path to a file or a file like object.
+        By file-like object, we refer to objects with a ``read()`` method,
+        such as a file handler (e.g. via builtin ``open`` function)
+        or ``StringIO`` or ``BytesIO``.
     infer_schema_length
         Maximum number of lines to read to infer schema.
     batch_size
@@ -82,7 +124,7 @@ def read_csv(
     projection
         Indexes of columns to select
     sep
-        Delimiter/ value seperator
+        Delimiter/ value separator
     columns
         Columns to project/ select
     rechunk
@@ -96,6 +138,8 @@ def read_csv(
         Overwrite the dtypes during inference
     use_pyarrow
         Use pyarrow's native CSV parser.
+    low_memory
+        Reduce memory usage in expense of performance
 
     Returns
     -------
@@ -114,9 +158,10 @@ def read_csv(
         and not ignore_errors
         and n_threads is None
         and encoding == "utf8"
+        and not low_memory
     ):
         tbl = pa.csv.read_csv(file, pa.csv.ReadOptions(skip_rows=skip_rows))
-        return from_arrow_table(tbl, rechunk)
+        return from_arrow(tbl, rechunk)
 
     df = DataFrame.read_csv(
         file=file,
@@ -133,6 +178,7 @@ def read_csv(
         encoding=encoding,
         n_threads=n_threads,
         dtype=dtype,
+        low_memory=low_memory,
     )
     if new_columns:
         df.columns = new_columns
@@ -217,7 +263,7 @@ def scan_parquet(
     )
 
 
-def read_ipc(file: Union[str, BinaryIO, Path]) -> "DataFrame":
+def read_ipc(file: Union[str, BinaryIO, Path], use_pyarrow: bool = True) -> "DataFrame":
     """
     Read into a DataFrame from Arrow IPC stream format. This is also called the feather format.
 
@@ -225,41 +271,54 @@ def read_ipc(file: Union[str, BinaryIO, Path]) -> "DataFrame":
     ----------
     file
         Path to a file or a file like object.
+    use_pyarrow
+        Use pyarrow or rust arrow backend
 
     Returns
     -------
     DataFrame
     """
     file = _prepare_file_arg(file)
-    return DataFrame.read_ipc(file)
+    return DataFrame.read_ipc(file, use_pyarrow)
 
 
 def read_parquet(
-    file: Union[str, BinaryIO, Path],
+    source: "Union[str, BinaryIO, Path, List[str]]",
     stop_after_n_rows: "Optional[int]" = None,
     memory_map=True,
+    columns: Optional[List[str]] = None,
+    **kwargs,
 ) -> "DataFrame":
     """
     Read into a DataFrame from a parquet file.
 
     Parameters
     ----------
-    file
-        Path to a file or a file like object.
+    source
+        Path to a file | list of files, or a file like object. If the path is a directory, that directory will be used
+        as partition aware scan.
     stop_after_n_rows
-        After n rows are read from the parquet stops reading.
+        After n rows are read from the parquet stops reading. Note: this cannot be used in partition aware parquet reads.
     memory_map
         Memory map underlying file. This will likely increase performance.
+    columns
+        Columns to project / select
+    **kwargs
+        kwargs for [pyarrow.parquet.read_table](https://arrow.apache.org/docs/python/generated/pyarrow.parquet.read_table.html)
 
     Returns
     -------
     DataFrame
     """
-    file = _prepare_file_arg(file)
+    source = _prepare_file_arg(source)
     if stop_after_n_rows is not None:
-        return DataFrame.read_parquet(file, stop_after_n_rows=stop_after_n_rows)
+        return DataFrame.read_parquet(source, stop_after_n_rows=stop_after_n_rows)
     else:
-        return from_arrow_table(pa.parquet.read_table(file, memory_map=memory_map))
+        return from_arrow(
+            pa.parquet.read_table(
+                source, memory_map=memory_map, columns=columns, **kwargs
+            )
+        )
 
 
 def arg_where(mask: "Series"):
@@ -280,11 +339,14 @@ def arg_where(mask: "Series"):
 
 def from_arrow_table(table: pa.Table, rechunk: bool = True) -> "DataFrame":
     """
+    .. deprecated:: 7.3
+        use `from_arrow`
+
     Create a DataFrame from an arrow Table
 
     Parameters
     ----------
-    table
+    a
         Arrow Table
     rechunk
         Make sure that all data is contiguous.
@@ -292,7 +354,27 @@ def from_arrow_table(table: pa.Table, rechunk: bool = True) -> "DataFrame":
     return DataFrame.from_arrow(table, rechunk)
 
 
-def from_pandas(df: "pandas.DataFrame", rechunk: bool = True) -> "DataFrame":
+def from_arrow(a: "Union[pa.Table, pa.Array]", rechunk: bool = True) -> "DataFrame":
+    """
+    Create a DataFrame from an arrow Table
+
+    Parameters
+    ----------
+    a
+        Arrow Table
+    rechunk
+        Make sure that all data is contiguous.
+    """
+    if isinstance(a, pa.Table):
+        return DataFrame.from_arrow(a, rechunk)
+    if isinstance(a, pa.Array):
+        return Series.from_arrow("", a)
+    raise ValueError(f"expected arrow table / array, got {a}")
+
+
+def from_pandas(
+    df: "pandas.DataFrame", rechunk: bool = True  # noqa: F821
+) -> "DataFrame":
     """
     Convert from a pandas DataFrame to a polars DataFrame
 
@@ -318,14 +400,17 @@ def from_pandas(df: "pandas.DataFrame", rechunk: bool = True) -> "DataFrame":
         if dtype == "object" and isinstance(df[name][0], str):
             data[name] = pa.array(df[name], pa.large_utf8())
         elif dtype == "datetime64[ns]":
-            data[name] = pa.compute.cast(
-                pa.array(np.array(df[name].values, dtype="datetime64[ms]")), pa.date64()
-            )
+            # We first cast to ms because that's the unit of Date64
+            # Then we cast to via int64 to date64. Casting directly to Date64 lead to
+            # loss of time information https://github.com/ritchie46/polars/issues/476
+            arr = pa.array(np.array(df[name].values, dtype="datetime64[ms]"))
+            arr = pa.compute.cast(arr, pa.int64())
+            data[name] = pa.compute.cast(arr, pa.date64())
         else:
             data[name] = pa.array(df[name])
 
     table = pa.table(data)
-    return from_arrow_table(table, rechunk)
+    return from_arrow(table, rechunk)
 
 
 def concat(dfs: "List[DataFrame]", rechunk=True) -> "DataFrame":
@@ -351,27 +436,6 @@ def concat(dfs: "List[DataFrame]", rechunk=True) -> "DataFrame":
     if rechunk:
         return df.rechunk()
     return df
-
-
-def arange(
-    lower: int, upper: int, step: Optional[int] = None, name: Optional[str] = None
-) -> Series:
-    """
-    Create a Series that ranges from lower bound to upper bound.
-    Parameters
-    ----------
-    lower
-        Lower bound value.
-    upper
-        Upper bound value.
-    step
-        Optional step size. If none given, the step size will be 1.
-    name
-        Name of the Series
-    """
-    if name is None:
-        name = ""
-    return Series(name, np.arange(lower, upper, step), nullable=False)
 
 
 def repeat(

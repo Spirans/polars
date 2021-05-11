@@ -24,6 +24,18 @@ impl<'a> Iterator for ExprIter<'a> {
                 IsNotNull(e) => push(e),
                 Cast { expr, .. } => push(expr),
                 Sort { expr, .. } => push(expr),
+                Take { expr, idx } => {
+                    push(expr);
+                    push(idx);
+                }
+                Filter { input, by } => {
+                    push(input);
+                    push(by)
+                }
+                SortBy { expr, by, .. } => {
+                    push(expr);
+                    push(by)
+                }
                 Agg(agg_e) => {
                     use AggExpr::*;
                     match agg_e {
@@ -56,7 +68,7 @@ impl<'a> Iterator for ExprIter<'a> {
                 Shift { input, .. } => push(input),
                 Reverse(e) => push(e),
                 Duplicated(e) => push(e),
-                Unique(e) => push(e),
+                IsUnique(e) => push(e),
                 Explode(e) => push(e),
                 Window {
                     function,
@@ -95,7 +107,7 @@ impl<'a> IntoIterator for &'a Expr {
 }
 
 impl AExpr {
-    /// Push nodes to a pre-allocated stack
+    /// Push nodes at this level to a pre-allocated stack
     pub(crate) fn nodes<'a>(&'a self, container: &mut Vec<Node>) {
         let mut push = |e: &'a Node| container.push(*e);
         use AExpr::*;
@@ -112,6 +124,18 @@ impl AExpr {
             IsNotNull(e) => push(e),
             Cast { expr, .. } => push(expr),
             Sort { expr, .. } => push(expr),
+            Take { expr, idx } => {
+                push(expr);
+                push(idx);
+            }
+            SortBy { expr, by, .. } => {
+                push(expr);
+                push(by);
+            }
+            Filter { input, by } => {
+                push(input);
+                push(by);
+            }
             Agg(agg_e) => {
                 use AAggExpr::*;
                 match agg_e {
@@ -144,7 +168,7 @@ impl AExpr {
             Shift { input, .. } => push(input),
             Reverse(e) => push(e),
             Duplicated(e) => push(e),
-            Unique(e) => push(e),
+            IsUnique(e) => push(e),
             Explode(e) => push(e),
             Window {
                 function,
@@ -202,5 +226,59 @@ impl<'a> ArenaExprIter<'a> for &'a Arena<AExpr> {
             stack,
             arena: Some(self),
         }
+    }
+}
+
+pub struct AlpIter<'a> {
+    stack: Vec<Node>,
+    arena: &'a Arena<ALogicalPlan>,
+}
+
+pub(crate) trait ArenaLpIter<'a> {
+    fn iter(&self, root: Node) -> AlpIter<'a>;
+}
+
+impl<'a> ArenaLpIter<'a> for &'a Arena<ALogicalPlan> {
+    fn iter(&self, root: Node) -> AlpIter<'a> {
+        let stack = vec![root];
+        AlpIter { stack, arena: self }
+    }
+}
+
+impl<'a> Iterator for AlpIter<'a> {
+    type Item = (Node, &'a ALogicalPlan);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.stack.pop().map(|node| {
+            let lp = self.arena.get(node);
+            lp.copy_inputs(&mut self.stack);
+            (node, lp)
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use polars_core::df;
+    use polars_core::prelude::*;
+
+    #[test]
+    fn test_lp_iter() -> Result<()> {
+        let df = df! {
+            "a" => [1, 2]
+        }?;
+
+        let (root, lp_arena, _expr_arena) = df
+            .lazy()
+            .sort("a", false)
+            .groupby(vec![col("a")])
+            .agg(vec![col("a").first()])
+            .logical_plan
+            .into_alp();
+
+        let cnt = (&lp_arena).iter(root).count();
+        assert_eq!(cnt, 3);
+        Ok(())
     }
 }

@@ -1,5 +1,9 @@
 #[macro_use]
 extern crate polars;
+
+use pyo3::prelude::*;
+use pyo3::wrap_pyfunction;
+
 use crate::lazy::dsl::PyExpr;
 use crate::{
     dataframe::PyDataFrame,
@@ -9,14 +13,12 @@ use crate::{
     },
     series::PySeries,
 };
-use pyo3::prelude::*;
-use pyo3::wrap_pyfunction;
 
+pub mod apply;
 pub mod arrow_interop;
 pub mod conversion;
 pub mod dataframe;
 pub mod datatypes;
-pub mod dispatch;
 pub mod error;
 pub mod file;
 pub mod lazy;
@@ -24,6 +26,14 @@ pub mod npy;
 pub mod prelude;
 pub mod series;
 pub mod utils;
+
+use mimalloc::MiMalloc;
+use std::iter::FromIterator;
+use crate::utils::str_to_polarstype;
+use polars::prelude::*;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[pyfunction]
 fn col(name: &str) -> dsl::PyExpr {
@@ -86,6 +96,20 @@ fn toggle_string_cache(toggle: bool) {
     polars::toggle_string_cache(toggle)
 }
 
+
+#[pyfunction]
+fn series_from_range(low: i64, high: i64, dtype: &PyAny) -> PySeries {
+    let str_repr = dtype.str().unwrap().to_str().unwrap();
+    let dtype = str_to_polarstype(str_repr);
+
+    match dtype {
+        DataType::UInt32 => Series::from_iter((low as u32)..(high as u32)).into(),
+        DataType::Int32 => Series::from_iter((low as i32)..(high as i32)).into(),
+        DataType::Int64 => Series::from_iter((low as i64)..(high as i64)).into(),
+        _ => unimplemented!()
+    }
+}
+
 #[pymodule]
 fn polars(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_class::<PySeries>().unwrap();
@@ -105,5 +129,6 @@ fn polars(_py: Python, m: &PyModule) -> PyResult<()> {
         .unwrap();
     m.add_wrapped(wrap_pyfunction!(except_)).unwrap();
     m.add_wrapped(wrap_pyfunction!(range)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(series_from_range)).unwrap();
     Ok(())
 }

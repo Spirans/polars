@@ -4,24 +4,85 @@ use crate::prelude::*;
 use ahash::RandomState;
 use polars_core::prelude::*;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(crate) fn has_aexpr(current_node: Node, arena: &Arena<AExpr>, matching_expr: &AExpr) -> bool {
-    arena.iter(current_node).any(|(_node, e)| match e {
-        AExpr::Agg(_) => false,
-        _ => std::mem::discriminant(e) == std::mem::discriminant(matching_expr),
-    })
+pub(crate) fn equal_aexprs(left: &[Node], right: &[Node], expr_arena: &Arena<AExpr>) -> bool {
+    left.iter()
+        .zip(right.iter())
+        .all(|(l, r)| AExpr::eq(*l, *r, expr_arena))
+}
+
+pub(crate) fn remove_duplicate_aexprs(exprs: &[Node], expr_arena: &Arena<AExpr>) -> Vec<Node> {
+    let mut unique = HashSet::with_capacity_and_hasher(exprs.len(), RandomState::new());
+    let mut new = Vec::with_capacity(exprs.len());
+    for node in exprs {
+        let mut can_insert = false;
+        for name in aexpr_to_root_names(*node, expr_arena) {
+            if unique.insert(name) {
+                can_insert = true
+            }
+        }
+        if can_insert {
+            new.push(*node)
+        }
+    }
+    new
+}
+
+pub(crate) trait PushNode {
+    fn push_node(&mut self, value: Node);
+}
+
+impl PushNode for Vec<Node> {
+    fn push_node(&mut self, value: Node) {
+        self.push(value)
+    }
+}
+
+impl PushNode for [Option<Node>; 2] {
+    fn push_node(&mut self, value: Node) {
+        match self {
+            [None, None] => self[0] = Some(value),
+            [Some(_), None] => self[1] = Some(value),
+            _ => panic!("cannot push more than 2 nodes"),
+        }
+    }
+}
+
+impl PushNode for [Option<Node>; 1] {
+    fn push_node(&mut self, value: Node) {
+        match self {
+            [Some(_)] => self[0] = Some(value),
+            _ => panic!("cannot push more than 2 nodes"),
+        }
+    }
+}
+
+impl PushNode for &mut [Option<Node>] {
+    fn push_node(&mut self, value: Node) {
+        if self[0].is_some() {
+            self[1] = Some(value)
+        } else {
+            self[0] = Some(value)
+        }
+    }
+}
+
+pub(crate) fn has_aexpr<F>(current_node: Node, arena: &Arena<AExpr>, matches: F) -> bool
+where
+    F: Fn(&AExpr) -> bool,
+{
+    arena.iter(current_node).any(|(_node, e)| matches(e))
 }
 
 /// Can check if an expression tree has a matching_expr. This
 /// requires a dummy expression to be created that will be used to patter match against.
-///
-/// Another option was to create a recursive macro but would increase code bloat.
-pub(crate) fn has_expr(current_expr: &Expr, matching_expr: &Expr) -> bool {
-    current_expr.into_iter().any(|e| match e {
-        Expr::Agg(_) => false,
-        _ => std::mem::discriminant(e) == std::mem::discriminant(matching_expr),
-    })
+pub(crate) fn has_expr<F>(current_expr: &Expr, matches: F) -> bool
+where
+    F: Fn(&Expr) -> bool,
+{
+    current_expr.into_iter().any(|e| matches(e))
 }
 
 /// output name of expr
@@ -100,7 +161,9 @@ pub(crate) fn rename_aexpr_root_name(
             });
             Ok(())
         }
-        _ => Err(PolarsError::Other("had more than one root columns".into())),
+        _ => {
+            panic!("had more than one root columns");
+        }
     }
 }
 
@@ -135,7 +198,7 @@ pub(crate) fn expressions_to_schema(expr: &[Expr], schema: &Schema, ctxt: Contex
 /// Get a set of the data source paths in this LogicalPlan
 pub(crate) fn agg_source_paths(
     root_lp: Node,
-    paths: &mut HashSet<String, RandomState>,
+    paths: &mut HashSet<PathBuf, RandomState>,
     lp_arena: &Arena<ALogicalPlan>,
 ) {
     use ALogicalPlan::*;
@@ -195,6 +258,13 @@ pub(crate) fn agg_source_paths(
         }
     }
 }
+
+pub(crate) fn try_path_to_str(path: &Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        PolarsError::Other(format!("Non-UTF8 file path: {}", path.to_string_lossy()).into())
+    })
+}
+
 pub(crate) fn aexpr_to_root_names(node: Node, arena: &Arena<AExpr>) -> Vec<Arc<String>> {
     aexpr_to_root_nodes(node, arena)
         .into_iter()
@@ -233,7 +303,7 @@ pub(crate) fn check_down_node(node: Node, down_schema: &Schema, expr_arena: &Are
             .map(|e| {
                 expr_arena
                     .get(*e)
-                    .to_field(down_schema, Context::Other, expr_arena)
+                    .to_field(down_schema, Context::Default, expr_arena)
                     .is_ok()
             })
             .all(|b| b),

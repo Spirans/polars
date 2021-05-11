@@ -1,23 +1,26 @@
 //! DataFrame module.
-use crate::chunked_array::ops::unique::is_unique_helper;
-use crate::frame::select::Selection;
-use crate::prelude::*;
-use crate::utils::{accumulate_dataframes_horizontal, accumulate_dataframes_vertical, NoNull};
-use ahash::RandomState;
-use arrow::record_batch::RecordBatch;
-use itertools::Itertools;
-use rayon::prelude::*;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::iter::Iterator;
 use std::mem;
 use std::sync::Arc;
 
+use ahash::RandomState;
+use arrow::record_batch::RecordBatch;
+use itertools::Itertools;
+use rayon::prelude::*;
+
+use crate::chunked_array::ops::unique::is_unique_helper;
+use crate::frame::select::Selection;
+use crate::prelude::*;
+use crate::utils::{
+    accumulate_dataframes_horizontal, accumulate_dataframes_vertical, get_supertype, NoNull,
+};
+
 mod arithmetic;
 pub mod explode;
-pub mod group_by;
+pub mod groupby;
 pub mod hash_join;
-pub mod resample;
 pub mod row;
 pub mod select;
 mod upstream_traits;
@@ -92,7 +95,7 @@ impl DataFrame {
 
             if names.contains(&name) {
                 return Err(PolarsError::Duplicate(
-                    format!("Column with name: '{}' has more than one occurences", name).into(),
+                    format!("Column with name: '{}' has more than one occurrences", name).into(),
                 ));
             }
 
@@ -114,27 +117,37 @@ impl DataFrame {
 
     /// Aggregate all chunks to contiguous memory.
     pub fn agg_chunks(&self) -> Self {
+        // Don't parallelize this. Memory overhead
         let f = |s: &Series| s.rechunk();
-        let cols = self.columns.par_iter().map(f).collect();
+        let cols = self.columns.iter().map(f).collect();
         DataFrame::new_no_checks(cols)
     }
 
     /// Aggregate all the chunks in the DataFrame to a single chunk.
     pub fn as_single_chunk(&mut self) -> &mut Self {
-        self.columns = self.columns.iter().map(|s| s.rechunk()).collect();
+        // Don't parallelize this. Memory overhead
+        for s in &mut self.columns {
+            *s = s.rechunk();
+        }
         self
     }
 
     /// Ensure all the chunks in the DataFrame are aligned.
     pub fn rechunk(&mut self) -> &mut Self {
-        if self.columns.iter().map(|s| s.chunk_lengths()).all_equal() {
+        // TODO: remove vec allocation
+        if self
+            .columns
+            .iter()
+            .map(|s| s.chunk_lengths().collect_vec())
+            .all_equal()
+        {
             self
         } else {
             self.as_single_chunk()
         }
     }
 
-    /// Get a reference to the DataFrame schema.
+    /// Get the DataFrame schema.
     pub fn schema(&self) -> Schema {
         let fields = Self::create_fields(&self.columns);
         Schema::new(fields)
@@ -144,6 +157,11 @@ impl DataFrame {
     #[inline]
     pub fn get_columns(&self) -> &Vec<Series> {
         &self.columns
+    }
+
+    /// Iterator over the columns as Series.
+    pub fn iter(&self) -> std::slice::Iter<'_, Series> {
+        self.columns.iter()
     }
 
     pub fn get_column_names(&self) -> Vec<&str> {
@@ -242,6 +260,11 @@ impl DataFrame {
         self.shape().0
     }
 
+    /// Check if DataFrame is empty
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+
     pub(crate) fn hstack_mut_no_checks(&mut self, columns: &[Series]) -> &mut Self {
         for col in columns {
             self.columns.push(col.clone());
@@ -267,7 +290,7 @@ impl DataFrame {
         // first loop check validity. We don't do this in a single pass otherwise
         // this DataFrame is already modified when an error occurs.
         for col in columns {
-            if col.len() != height {
+            if col.len() != height && height != 0 {
                 return Err(PolarsError::ShapeMisMatch(
                     format!("Could not horizontally stack Series. The Series length {} differs from the DataFrame height: {}", col.len(), height).into()));
             }
@@ -310,22 +333,23 @@ impl DataFrame {
             ));
         }
 
-        if self.dtypes() != df.dtypes() {
-            return Err(PolarsError::DataTypeMisMatch(
-                format!(
-                    "cannot vstack: data types don't match of {:?} {:?}",
-                    self.head(Some(2)),
-                    df.head(Some(2))
-                )
-                .into(),
-            ));
-        }
         self.columns
             .iter_mut()
             .zip(df.columns.iter())
-            .for_each(|(left, right)| {
+            .try_for_each(|(left, right)| {
+                if left.dtype() != right.dtype() {
+                    return Err(PolarsError::DataTypeMisMatch(
+                        format!(
+                            "cannot vstack: data types don't match of {:?} {:?}",
+                            left, right
+                        )
+                        .into(),
+                    ));
+                }
+
                 left.append(right).expect("should not fail");
-            });
+                Ok(())
+            })?;
         // don't rechunk here. Chunks in columns always match.
         Ok(self)
     }
@@ -410,13 +434,17 @@ impl DataFrame {
         self.insert_at_idx_no_name_check(index, series)
     }
 
-    /// Add a new column to this `DataFrame`.
-    pub fn add_column<S: IntoSeries>(&mut self, column: S) -> Result<&mut Self> {
+    /// Add a new column to this `DataFrame` or replace an existing one.
+    pub fn with_column<S: IntoSeries>(&mut self, column: S) -> Result<&mut Self> {
         let series = column.into_series();
-        self.has_column(series.name())?;
-        if series.len() == self.height() {
-            self.columns.push(series);
-            self.rechunk();
+        if series.len() == self.height() || self.is_empty() {
+            if self.has_column(series.name()).is_err() {
+                let name = series.name().to_string();
+                self.apply(&name, |_| series)?;
+            } else {
+                self.columns.push(series);
+                self.rechunk();
+            }
             Ok(self)
         } else {
             Err(PolarsError::ShapeMisMatch(
@@ -428,13 +456,6 @@ impl DataFrame {
                 .into(),
             ))
         }
-    }
-
-    /// Create a new `DataFrame` with the column added.
-    pub fn with_column<S: IntoSeries>(&self, column: S) -> Result<Self> {
-        let mut df = self.clone();
-        df.add_column(column)?;
-        Ok(df)
     }
 
     /// Get a row in the `DataFrame` Beware this is slow.
@@ -553,6 +574,17 @@ impl DataFrame {
     }
 
     /// Take DataFrame rows by a boolean mask.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polars_core::prelude::*;
+    /// fn example(df: &DataFrame) -> Result<DataFrame> {
+    ///     let mask = df.column("sepal.width")?.is_not_null();
+    ///     df.filter(&mask)
+    /// }
+    ///
+    /// ```
     pub fn filter(&self, mask: &BooleanChunked) -> Result<Self> {
         let new_col = self
             .columns
@@ -724,20 +756,93 @@ impl DataFrame {
 
     /// Sort DataFrame in place by a column.
     pub fn sort_in_place(&mut self, by_column: &str, reverse: bool) -> Result<&mut Self> {
-        let s = self.column(by_column)?;
-
-        let take = s.argsort(reverse);
-
-        self.columns = self.columns.par_iter().map(|s| s.take(&take)).collect();
+        self.columns = self.sort(by_column, reverse)?.columns;
         Ok(self)
     }
 
-    /// Return a sorted clone of this DataFrame.
-    pub fn sort(&self, by_column: &str, reverse: bool) -> Result<Self> {
-        let s = self.column(by_column)?;
+    /// This is the dispatch of Self::sort, and exists to reduce compile bloat by monomorphization.
+    fn sort_impl(&self, by_column: Vec<&str>, mut reverse: Vec<bool>) -> Result<Self> {
+        let take = match by_column.len() {
+            1 => {
+                let s = self.column(by_column[0])?;
+                s.argsort(reverse[0])
+            }
+            n_cols => {
+                #[cfg(feature = "sort_multiple")]
+                {
+                    let mut columns = self.select_series(by_column)?;
 
-        let take = s.argsort(reverse);
+                    // we only allow this implementation of the same types
+                    // se we determine the supertypes and coerce all series.
+                    let mut first = columns.remove(0);
+                    let dtype = if first.utf8().is_ok() {
+                        Some(DataType::Float64)
+                    } else {
+                        columns.iter().try_fold::<_, _, Result<_>>(None, |acc, s| {
+                            let acc = match (&acc, s.dtype()) {
+                                (_, DataType::Utf8) => acc,
+                                (None, dt) => Some(dt.clone()),
+                                (Some(acc), dt) => Some(get_supertype(acc, dt)?),
+                            };
+                            Ok(acc)
+                        })?
+                    };
+
+                    if let Some(dtype) = dtype {
+                        columns = columns
+                            .into_iter()
+                            .map(|s| match s.dtype() {
+                                DataType::Utf8 => s,
+                                _ => s.cast_with_dtype(&dtype).expect("supertype is known"),
+                            })
+                            .collect::<Vec<_>>();
+
+                        // broadcast ordering
+                        if n_cols > reverse.len() && reverse.len() == 1 {
+                            while n_cols != reverse.len() {
+                                reverse.push(reverse[0]);
+                            }
+                        }
+
+                        if !matches!(first.dtype(), DataType::Utf8) {
+                            first = first.cast_with_dtype(&dtype)?;
+                        }
+                    }
+
+                    first.argsort_multiple(&columns, &reverse)?
+                }
+                #[cfg(not(feature = "sort_multiple"))]
+                {
+                    panic!("activate `sort_multiple` feature gate to enable this functionality");
+                }
+            }
+        };
         Ok(self.take(&take))
+    }
+
+    /// Return a sorted clone of this DataFrame.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use polars_core::prelude::*;
+    ///
+    /// fn sort_example(df: &DataFrame, reverse: bool) -> Result<DataFrame> {
+    ///     df.sort("a", reverse)
+    /// }
+    ///
+    /// fn sort_by_multiple_columns_example(df: &DataFrame) -> Result<DataFrame> {
+    ///     df.sort(&["a", "b"], vec![false, true])
+    /// }
+    /// ```
+    pub fn sort<'a, S, J>(&self, by_column: S, reverse: impl IntoVec<bool>) -> Result<Self>
+    where
+        S: Selection<'a, J>,
+    {
+        // we do this heap allocation and dispatch to reduce monomorphization bloat
+        let by_column = by_column.to_selection_vec();
+        let reverse = reverse.into_vec();
+        self.sort_impl(by_column, reverse)
     }
 
     /// Replace a column with a series.
@@ -749,7 +854,7 @@ impl DataFrame {
     pub fn replace_or_add<S: IntoSeries>(&mut self, column: &str, new_col: S) -> Result<&mut Self> {
         let new_col = new_col.into_series();
         match self.replace(column, new_col.clone()) {
-            Err(_) => self.add_column(new_col),
+            Err(_) => self.with_column(new_col),
             Ok(_) => Ok(self),
         }
     }
@@ -1036,13 +1141,13 @@ impl DataFrame {
     }
 
     /// Slice the DataFrame along the rows.
-    pub fn slice(&self, offset: usize, length: usize) -> Result<Self> {
+    pub fn slice(&self, offset: i64, length: usize) -> Self {
         let col = self
             .columns
-            .par_iter()
+            .iter()
             .map(|s| s.slice(offset, length))
-            .collect::<Result<Vec<_>>>()?;
-        Ok(DataFrame::new_no_checks(col))
+            .collect::<Vec<_>>();
+        DataFrame::new_no_checks(col)
     }
 
     /// Get the head of the DataFrame
@@ -1196,6 +1301,116 @@ impl DataFrame {
             .map(|s| s.quantile_as_series(quantile))
             .collect::<Result<Vec<_>>>()?;
         Ok(DataFrame::new_no_checks(columns))
+    }
+
+    /// Aggregate the column horizontally to their min values
+    pub fn hmin(&self) -> Result<Option<Series>> {
+        match self.columns.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.columns[0].clone())),
+            _ => {
+                let first = Cow::Borrowed(&self.columns[0]);
+
+                self.columns[1..]
+                    .iter()
+                    .try_fold(first, |acc, s| {
+                        let mask = acc.lt(s) & acc.is_not_null() | s.is_null();
+                        let min = acc.zip_with(&mask, s)?;
+
+                        Ok(Cow::Owned(min))
+                    })
+                    .map(|s| Some(s.into_owned()))
+            }
+        }
+    }
+
+    /// Aggregate the column horizontally to their max values
+    pub fn hmax(&self) -> Result<Option<Series>> {
+        match self.columns.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.columns[0].clone())),
+            _ => {
+                let first = Cow::Borrowed(&self.columns[0]);
+
+                self.columns[1..]
+                    .iter()
+                    .try_fold(first, |acc, s| {
+                        let mask = acc.gt(s) & acc.is_not_null() | s.is_null();
+                        let max = acc.zip_with(&mask, s)?;
+
+                        Ok(Cow::Owned(max))
+                    })
+                    .map(|s| Some(s.into_owned()))
+            }
+        }
+    }
+
+    /// Aggregate the column horizontally to their sum values
+    pub fn hsum(&self) -> Result<Option<Series>> {
+        match self.columns.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.columns[0].clone())),
+            _ => {
+                let first = Cow::Borrowed(&self.columns[0]);
+                self.columns[1..]
+                    .iter()
+                    .map(Cow::Borrowed)
+                    .try_fold(first, |acc, s| {
+                        let mut acc = acc.as_ref().clone();
+                        let mut s = s.as_ref().clone();
+
+                        if acc.null_count() != 0 {
+                            acc = acc.fill_none(FillNoneStrategy::Zero)?;
+                        }
+                        if s.null_count() != 0 {
+                            s = s.fill_none(FillNoneStrategy::Zero)?;
+                        }
+                        Ok(Cow::Owned(&acc + &s))
+                    })
+                    .map(|s| Some(s.into_owned()))
+            }
+        }
+    }
+
+    /// Aggregate the column horizontally to their mean values
+    pub fn hmean(&self) -> Result<Option<Series>> {
+        match self.columns.len() {
+            0 => Ok(None),
+            1 => Ok(Some(self.columns[0].clone())),
+            _ => {
+                let sum = self.hsum()?;
+
+                let first: Cow<Series> = Cow::Owned(
+                    self.columns[0]
+                        .is_null()
+                        .cast::<UInt32Type>()
+                        .unwrap()
+                        .into_series(),
+                );
+                let null_count = self.columns[1..]
+                    .iter()
+                    .map(Cow::Borrowed)
+                    .fold(first, |acc, s| {
+                        Cow::Owned(
+                            acc.as_ref() + &s.is_null().cast::<UInt32Type>().unwrap().into_series(),
+                        )
+                    })
+                    .into_owned();
+
+                // value lengths: len - null_count
+                let value_length: UInt32Chunked =
+                    (self.width().sub(&null_count)).u32().unwrap().clone();
+
+                // make sure that we do not divide by zero
+                // by replacing with None
+                let value_length = value_length
+                    .set(&value_length.eq(0), None)?
+                    .into_series()
+                    .cast::<Float64Type>()?;
+
+                Ok(sum.map(|sum| &sum / &value_length))
+            }
+        }
     }
 
     /// Pipe different functions/ closure operations that work on a DataFrame together.
@@ -1383,7 +1598,7 @@ impl<'a> Iterator for RecordBatchIter<'a> {
         let mut rb_cols = Vec::with_capacity(self.columns.len());
         // take a slice from all columns and add the the current RecordBatch
         self.columns.iter().for_each(|s| {
-            let slice = s.slice(self.idx, length).unwrap();
+            let slice = s.slice(self.idx as i64, length);
             rb_cols.push(Arc::clone(&slice.chunks()[0]))
         });
         let rb = RecordBatch::try_new(Arc::clone(&self.schema), rb_cols).unwrap();
@@ -1452,11 +1667,13 @@ impl std::convert::TryFrom<Vec<RecordBatch>> for DataFrame {
 
 #[cfg(test)]
 mod test {
-    use crate::prelude::*;
+    use std::convert::TryFrom;
+
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use std::convert::TryFrom;
+
+    use crate::prelude::*;
 
     fn create_frame() -> DataFrame {
         let s0 = Series::new("days", [0, 1, 2].as_ref());
@@ -1576,12 +1793,13 @@ mod test {
     #[test]
     fn slice() {
         let df = create_frame();
-        let sliced_df = df.slice(0, 2).expect("slice");
+        let sliced_df = df.slice(0, 2);
         assert_eq!(sliced_df.shape(), (2, 2));
         println!("{:?}", df)
     }
 
     #[test]
+    #[cfg(feature = "dtype-u8")]
     fn get_dummies() {
         let df = df! {
             "id" => &[1, 2, 3, 1, 2, 3, 1, 1],
@@ -1613,8 +1831,10 @@ mod test {
             "foo" => &[1, 2, 3]
         }
         .unwrap();
-        assert!(df.add_column(Series::new("foo", &[1, 2, 3])).is_err());
-        assert!(df.add_column(Series::new("bar", &[1, 2, 3])).is_ok());
+        // check if column is replaced
+        assert!(df.with_column(Series::new("foo", &[1, 2, 3])).is_ok());
+        assert!(df.with_column(Series::new("bar", &[1, 2, 3])).is_ok());
+        assert!(df.column("bar").is_ok())
     }
 
     #[test]
@@ -1651,7 +1871,32 @@ mod test {
         }
         .unwrap();
 
-        df.vstack_mut(&df.slice(0, 3).unwrap()).unwrap();
+        df.vstack_mut(&df.slice(0, 3)).unwrap();
         assert_eq!(df.n_chunks().unwrap(), 2)
+    }
+
+    #[test]
+    fn test_h_agg() {
+        let a = Series::new("a", &[1, 2, 6]);
+        let b = Series::new("b", &[Some(1), None, None]);
+        let c = Series::new("c", &[Some(4), None, Some(3)]);
+
+        let df = DataFrame::new(vec![a, b, c]).unwrap();
+        assert_eq!(
+            Vec::from(df.hmean().unwrap().unwrap().f64().unwrap()),
+            &[Some(2.0), Some(2.0), Some(4.5)]
+        );
+        assert_eq!(
+            Vec::from(df.hsum().unwrap().unwrap().i32().unwrap()),
+            &[Some(6), Some(2), Some(9)]
+        );
+        assert_eq!(
+            Vec::from(df.hmin().unwrap().unwrap().i32().unwrap()),
+            &[Some(1), Some(2), Some(3)]
+        );
+        assert_eq!(
+            Vec::from(df.hmax().unwrap().unwrap().i32().unwrap()),
+            &[Some(4), Some(2), Some(6)]
+        );
     }
 }

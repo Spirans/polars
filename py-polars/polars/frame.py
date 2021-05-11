@@ -1,12 +1,13 @@
+from io import BytesIO
+
 try:
-    from .polars import (
+    from .polars import (  # noqa: F401
         PyDataFrame,
         PySeries,
-        PyLazyFrame,
+        toggle_string_cache as pytoggle_string_cache,
         version,
-        toggle_string_cache,
     )
-except:
+except ImportError:
     import warnings
 
     warnings.warn("binary files missing")
@@ -25,20 +26,29 @@ from typing import (
     Any,
 )
 from .series import Series, wrap_s
-from .datatypes import *
-from .html import NotebookFormatter
+from . import datatypes
+from .datatypes import DataType, pytype_to_polars_type
+from ._html import NotebookFormatter
+from .utils import coerce_arrow
+import polars
 import pyarrow as pa
 import pyarrow.parquet
+import pyarrow.feather
 import numpy as np
 import os
 from pathlib import Path
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .lazy import LazyFrame, Expr
 
 
 def wrap_df(df: "PyDataFrame") -> "DataFrame":
     return DataFrame._from_pydf(df)
 
 
-def prepare_other(other: Any) -> Series:
+def _prepare_other_arg(other: Any) -> Series:
     # if not a series create singleton series such that it will broadcast
     if not isinstance(other, Series):
         if isinstance(other, str):
@@ -50,9 +60,15 @@ def prepare_other(other: Any) -> Series:
     return other
 
 
+def _is_expr(arg: Any) -> bool:
+    return hasattr(arg, "_pyexpr")
+
+
 class DataFrame:
     def __init__(
-        self, data: "Union[Dict[str, Sequence], List[Series]]", nullable: bool = True
+        self,
+        data: "Union[Dict[str, Sequence], List[Series], np.ndarray]",
+        nullable: bool = True,
     ):
         """
         A DataFrame is a two dimensional data structure that represents data as a table with rows and columns.
@@ -62,6 +78,13 @@ class DataFrame:
         if isinstance(data, dict):
             for k, v in data.items():
                 columns.append(Series(k, v, nullable=nullable).inner())
+        elif isinstance(data, np.ndarray):
+            shape = data.shape
+            if len(shape) == 2:
+                for i, c in enumerate(range(shape[1])):
+                    columns.append(Series(str(i), data[:, c], nullable=False).inner())
+            else:
+                raise ValueError("a numpy array should have 2 dimensions")
         elif isinstance(data, list):
             for s in data:
                 if not isinstance(s, Series):
@@ -107,6 +130,7 @@ class DataFrame:
         encoding: str = "utf8",
         n_threads: Optional[int] = None,
         dtype: "Optional[Dict[str, DataType]]" = None,
+        low_memory: bool = False,
     ) -> "DataFrame":
         """
         Read a CSV file into a Dataframe.
@@ -163,12 +187,15 @@ class DataFrame:
             n_threads,
             path,
             dtype,
+            low_memory,
         )
         return self
 
     @staticmethod
     def read_parquet(
-        file: Union[str, BinaryIO], stop_after_n_rows: "Optional[int]" = None
+        file: Union[str, BinaryIO],
+        stop_after_n_rows: "Optional[int]" = None,
+        use_pyarrow=False,
     ) -> "DataFrame":
         """
         Read into a DataFrame from a parquet file.
@@ -179,17 +206,22 @@ class DataFrame:
             Path to a file or a file like object. Any valid filepath can be used.
         stop_after_n_rows
             Only read specified number of rows of the dataset. After `n` stops reading.
-
-        Returns
-        ---
-        DataFrame
+        use_pyarrow
+            Use pyarrow instead of the rust native parquet reader. The pyarrow reader is more stable.
         """
+        if use_pyarrow:
+            if stop_after_n_rows:
+                raise ValueError(
+                    "stop_after_n_rows can not be used with 'use_pyarrow==True'"
+                )
+            tbl = pa.parquet.read_table(file)
+            return DataFrame.from_arrow(tbl)
         self = DataFrame.__new__(DataFrame)
         self._df = PyDataFrame.read_parquet(file, stop_after_n_rows)
         return self
 
     @staticmethod
-    def read_ipc(file: Union[str, BinaryIO]) -> "DataFrame":
+    def read_ipc(file: Union[str, BinaryIO], use_pyarrow: bool = True) -> "DataFrame":
         """
         Read into a DataFrame from Arrow IPC stream format. This is also called the feather format.
 
@@ -197,11 +229,17 @@ class DataFrame:
         ----------
         file
             Path to a file or a file like object.
+        use_pyarrow
+            Use pyarrow or rust arrow backend
 
         Returns
         -------
         DataFrame
         """
+        if use_pyarrow:
+            tbl = pa.feather.read_table(file)
+            return DataFrame.from_arrow(tbl)
+
         self = DataFrame.__new__(DataFrame)
         self._df = PyDataFrame.read_ipc(file)
         return self
@@ -209,7 +247,9 @@ class DataFrame:
     @staticmethod
     def from_arrow(table: pa.Table, rechunk: bool = True) -> "DataFrame":
         """
-        Create DataFrame from arrow Table
+        Create DataFrame from arrow Table.
+        Most will be zero copy. Types that are not supported by Polars may be cast to a closest
+        supported type.
 
         Parameters
         ----------
@@ -218,6 +258,18 @@ class DataFrame:
         rechunk
             Make sure that all data is contiguous.
         """
+        data = {}
+        for i, column in enumerate(table):
+            # extract the name before casting
+            if column._name is None:
+                name = f"column_{i}"
+            else:
+                name = column._name
+
+            column = coerce_arrow(column)
+            data[name] = column
+
+        table = pa.table(data)
         batches = table.to_batches()
         self = DataFrame.__new__(DataFrame)
         self._df = PyDataFrame.from_arrow_record_batches(batches)
@@ -233,7 +285,9 @@ class DataFrame:
         record_batches = self._df.to_arrow()
         return pa.Table.from_batches(record_batches)
 
-    def to_pandas(self, *args, date_as_object=False, **kwargs) -> "pd.DataFrame":
+    def to_pandas(
+        self, *args, date_as_object=False, **kwargs
+    ) -> "pd.DataFrame":  # noqa: F821
         """
         Cast to a Pandas DataFrame. This requires that Pandas is installed.
         This operation clones data.
@@ -266,13 +320,13 @@ class DataFrame:
 
     def to_csv(
         self,
-        file: Union[TextIO, str, Path],
+        file: "Optional[Union[TextIO, str, Path]]" = None,
         batch_size: int = 100000,
         has_headers: bool = True,
         delimiter: str = ",",
     ):
         """
-        Write Dataframe to comma-seperated values file (csv)
+        Write Dataframe to comma-separated values file (csv)
 
         Parameters
         ---
@@ -296,6 +350,11 @@ class DataFrame:
         >>> dataframe.to_csv('new_file.csv', sep=',')
         ```
         """
+        if file is None:
+            buffer = BytesIO()
+            self._df.to_csv(buffer, batch_size, has_headers, ord(delimiter))
+            return str(buffer.getvalue(), encoding="utf-8")
+
         if isinstance(file, Path):
             file = str(file)
 
@@ -371,19 +430,19 @@ class DataFrame:
         return np.vstack([self[:, i].to_numpy() for i in range(self.width)]).T
 
     def __mul__(self, other):
-        other = prepare_other(other)
+        other = _prepare_other_arg(other)
         return wrap_df(self._df.mul(other._s))
 
     def __truediv__(self, other):
-        other = prepare_other(other)
+        other = _prepare_other_arg(other)
         return wrap_df(self._df.div(other._s))
 
     def __add__(self, other):
-        other = prepare_other(other)
+        other = _prepare_other_arg(other)
         return wrap_df(self._df.add(other._s))
 
     def __sub__(self, other):
-        other = prepare_other(other)
+        other = _prepare_other_arg(other)
         return wrap_df(self._df.sub(other._s))
 
     def __str__(self) -> str:
@@ -404,7 +463,20 @@ class DataFrame:
     def __iter__(self):
         return self.get_columns().__iter__()
 
+    def find_idx_by_name(self, name: str) -> int:
+        """
+        Find the index of a column by name
+
+        Parameters
+        ----------
+        name
+            Name of the column to find
+        """
+        return self._df.find_idx_by_name(name)
+
     def __getitem__(self, item):
+        if hasattr(item, "_pyexpr"):
+            return self.select(item)
         if isinstance(item, np.ndarray):
             item = Series("", item)
         # select rows and columns at once
@@ -418,7 +490,21 @@ class DataFrame:
                 # multiple slices
                 # df[:, :]
                 if isinstance(col_selection, slice):
-                    # TODO: select by indexes as column names can be duplicates
+                    # slice can be
+                    # by index
+                    #   [1:8]
+                    # or by column name
+                    #   ["foo":"bar"]
+                    # first we make sure that the slice is by index
+                    start = col_selection.start
+                    stop = col_selection.stop
+                    if isinstance(col_selection.start, str):
+                        start = self.find_idx_by_name(col_selection.start)
+                    if isinstance(col_selection.stop, str):
+                        stop = self.find_idx_by_name(col_selection.stop) + 1
+
+                    col_selection = slice(start, stop, col_selection.step)
+
                     df = self.__getitem__(self.columns[col_selection])
                     return df[row_selection]
 
@@ -427,6 +513,12 @@ class DataFrame:
                 series = self.__getitem__(col_selection)
                 # s[:]
                 wrap_s(series[row_selection])
+
+            # df[2, :] (select row as df)
+            if isinstance(row_selection, int):
+                if isinstance(col_selection, slice):
+                    df = self[:, col_selection]
+                    return df.slice(row_selection, 1)
 
             # column selection can be "a" and ["a", "b"]
             if isinstance(col_selection, str):
@@ -460,8 +552,11 @@ class DataFrame:
 
         # select multiple columns
         # df["foo", "bar"]
-        if isinstance(item, Sequence) and isinstance(item[0], str):
-            return wrap_df(self._df.select(item))
+        if isinstance(item, Sequence):
+            if isinstance(item[0], str):
+                return wrap_df(self._df.select(item))
+            if hasattr(item[0], "_pyexpr"):
+                return self.select(item)
 
         # select rows by mask or index
         # df[[1, 2, 3]]
@@ -479,9 +574,9 @@ class DataFrame:
                 else:
                     return wrap_df(self._df.take(item))
             dtype = item.dtype
-            if dtype == Boolean:
+            if dtype == datatypes.Boolean:
                 return wrap_df(self._df.filter(item.inner()))
-            if dtype == UInt32:
+            if dtype == datatypes.UInt32:
                 return wrap_df(self._df.take_with_series(item.inner()))
 
     def __setitem__(self, key, value):
@@ -489,7 +584,7 @@ class DataFrame:
         if isinstance(key, str):
             try:
                 self.drop_in_place(key)
-            except:
+            except Exception:
                 pass
             self.hstack([Series(key, value)], in_place=True)
         # df[idx] = series
@@ -525,6 +620,21 @@ class DataFrame:
 
     def insert_at_idx(self, index: int, series: Series):
         self._df.insert_at_idx(index, series._s)
+
+    def filter(self, predicate: "Expr") -> "DataFrame":
+        """
+        Filter the rows in the DataFrame based on a predicate expression.
+
+        Parameters
+        ----------
+        predicate
+            Expression that evaluates to a boolean Series
+        """
+        return (
+            self.lazy()
+            .filter(predicate)
+            .collect(no_optimization=True, string_cache=False)
+        )
 
     @property
     def shape(self) -> Tuple[int, int]:
@@ -641,7 +751,61 @@ class DataFrame:
         ╰─────┴─────┴─────╯
         ```
         """
-        return [dtypes[idx] for idx in self._df.dtypes()]
+        return [datatypes.dtypes[idx] for idx in self._df.dtypes()]
+
+    def describe(self):
+        """
+        Summary statistics for a DataFrame. Only summarizes numeric datatypes at the moment and returns nulls for non numeric datatypes.
+
+        Example
+        ---
+        ```python
+        >>> df = pl.DataFrame({
+            'a': [1.0, 2.8, 3.0],
+            'b': [4, 5, 6],
+            "c": [True, False, True]
+            })
+        >>> df.describe()
+        shape: (5, 4)
+        ╭──────────┬───────┬─────┬──────╮
+        │ describe ┆ a     ┆ b   ┆ c    │
+        │ ---      ┆ ---   ┆ --- ┆ ---  │
+        │ str      ┆ f64   ┆ f64 ┆ f64  │
+        ╞══════════╪═══════╪═════╪══════╡
+        │ "mean"   ┆ 2.267 ┆ 5   ┆ null │
+        ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┤
+        │ "std"    ┆ 1.102 ┆ 1   ┆ null │
+        ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┤
+        │ "min"    ┆ 1     ┆ 4   ┆ 0.0  │
+        ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┤
+        │ "max"    ┆ 3     ┆ 6   ┆ 1    │
+        ├╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌╌┤
+        │ "median" ┆ 2.8   ┆ 5   ┆ null │
+        ╰──────────┴───────┴─────┴──────╯
+        """
+
+        def describe_cast(self):
+            columns = []
+            for s in self:
+                if s.is_numeric() or s.is_boolean():
+                    columns.append(s.cast(float))
+                else:
+                    columns.append(s)
+            return polars.DataFrame(columns)
+
+        summary = polars.concat(
+            [
+                describe_cast(self.mean()),
+                describe_cast(self.std()),
+                describe_cast(self.min()),
+                describe_cast(self.max()),
+                describe_cast(self.median()),
+            ]
+        )
+        summary.insert_at_idx(
+            0, polars.Series("describe", ["mean", "std", "min", "max", "median"])
+        )
+        return summary
 
     def replace_at_idx(self, index: int, series: Series):
         """
@@ -657,14 +821,17 @@ class DataFrame:
         self._df.replace_at_idx(index, series._s)
 
     def sort(
-        self, by_column: str, in_place: bool = False, reverse: bool = False
+        self,
+        by: "Union[str, Expr, List[Expr]]",
+        in_place: bool = False,
+        reverse: "Union[bool, List[bool]]" = False,
     ) -> Optional["DataFrame"]:
         """
         Sort the DataFrame by column
 
         Parameters
         ----------
-        by_column
+        by
             By which column to sort. Only accepts string.
         in_place
             Perform operation in-place.
@@ -674,13 +841,13 @@ class DataFrame:
         Example
         ---
         ```python
-        >>> pl.DataFrame({
+        >>> df = pl.DataFrame({
             "foo": [1, 2, 3],
             "bar": [6.0, 7.0, 8.0],
             "ham": ['a', 'b', 'c']
             })
 
-        >>> dataframe.sort('foo', reverse=True)
+        >>> df.sort('foo', reverse=True)
         shape: (3, 3)
         ╭─────┬─────┬─────╮
         │ foo ┆ bar ┆ ham │
@@ -694,11 +861,29 @@ class DataFrame:
         │ 1   ┆ 6   ┆ "a" │
         ╰─────┴─────┴─────╯
         ```
+
+        ### Sort by multiple columns.
+
+        For multiple columns we can also use expression syntax
+
+        ```python
+        df.sort([col("foo"), col("bar") ** 2], reverse=[True, False])
+        ```
         """
+        if type(by) is list or _is_expr(by):
+            df = (
+                self.lazy()
+                .sort(by, reverse)
+                .collect(no_optimization=True, string_cache=False)
+            )
+            if in_place:
+                self._df = df._df
+                return
+            return df
         if in_place:
-            self._df.sort_in_place(by_column, reverse)
+            self._df.sort_in_place(by, reverse)
         else:
-            return wrap_df(self._df.sort(by_column, reverse))
+            return wrap_df(self._df.sort(by, reverse))
 
     def frame_equal(self, other: "DataFrame", null_equal: bool = False) -> bool:
         """
@@ -862,6 +1047,68 @@ class DataFrame:
         ----------
         by
             Column(s) to group by.
+
+        # Example
+
+        Below we group by column `"a"`, and we sum column `"b"`.
+
+        ```python
+        >>> df = pl.DataFrame(
+            {
+                "a": ["a", "b", "a", "b", "b", "c"],
+                "b": [1, 2, 3, 4, 5, 6],
+                "c": [6, 5, 4, 3, 2, 1],
+            }
+        )
+
+        assert (
+            df.groupby("a")["b"]
+            .sum()
+            .sort(by_column="a")
+            .frame_equal(DataFrame({"a": ["a", "b", "c"], "": [4, 11, 6]}))
+        )
+        ```
+
+        We can also loop over the grouped `DataFrame`
+
+        ```python
+        for sub_df in df.groupby("a"):
+            print(sub_df)
+        ```
+        Outputs:
+        ```text
+        shape: (3, 3)
+        ╭─────┬─────┬─────╮
+        │ a   ┆ b   ┆ c   │
+        │ --- ┆ --- ┆ --- │
+        │ str ┆ i64 ┆ i64 │
+        ╞═════╪═════╪═════╡
+        │ "b" ┆ 2   ┆ 5   │
+        ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┤
+        │ "b" ┆ 4   ┆ 3   │
+        ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┤
+        │ "b" ┆ 5   ┆ 2   │
+        ╰─────┴─────┴─────╯
+        shape: (1, 3)
+        ╭─────┬─────┬─────╮
+        │ a   ┆ b   ┆ c   │
+        │ --- ┆ --- ┆ --- │
+        │ str ┆ i64 ┆ i64 │
+        ╞═════╪═════╪═════╡
+        │ "c" ┆ 6   ┆ 1   │
+        ╰─────┴─────┴─────╯
+        shape: (2, 3)
+        ╭─────┬─────┬─────╮
+        │ a   ┆ b   ┆ c   │
+        │ --- ┆ --- ┆ --- │
+        │ str ┆ i64 ┆ i64 │
+        ╞═════╪═════╪═════╡
+        │ "a" ┆ 1   ┆ 6   │
+        ├╌╌╌╌╌┼╌╌╌╌╌┼╌╌╌╌╌┤
+        │ "a" ┆ 3   ┆ 4   │
+        ╰─────┴─────┴─────╯
+        ```
+
         """
         if isinstance(by, str):
             by = [by]
@@ -880,10 +1127,12 @@ class DataFrame:
             Units of the downscaling operation.
 
             Any of:
-                - "second"
-                - "minute"
-                - "hour"
+                - "month"
+                - "week"
                 - "day"
+                - "hour"
+                - "minute"
+                - "second"
 
         n
             Number of units (e.g. 5 "day", 15 "minute"
@@ -893,8 +1142,8 @@ class DataFrame:
     def join(
         self,
         df: "DataFrame",
-        left_on: "Optional[Union[str, List[str]]]" = None,
-        right_on: "Optional[Union[str, List[str]]]" = None,
+        left_on: "Optional[Union[str, List[str]], Expr, List[Expr]]" = None,
+        right_on: "Optional[Union[str, List[str]], Expr, List[Expr]]" = None,
         on: "Optional[Union[str, List[str]]]" = None,
         how="inner",
     ) -> "DataFrame":
@@ -977,10 +1226,43 @@ class DataFrame:
             right_on = on
         if left_on is None or right_on is None:
             raise ValueError("you should pass the column to join on as an argument")
+        if _is_expr(left_on[0]) or _is_expr(right_on[0]):
+            return self.lazy().join(df.lazy(), left_on, right_on, how=how)
 
         out = self._df.join(df._df, left_on, right_on, how)
 
         return wrap_df(out)
+
+    def apply(
+        self, f: "Callable[[Tuple[Any]], Any]", output_type: "Optional[DataType]" = None
+    ) -> "Series":
+        """
+        Apply a custom function over the rows of the DataFrame. The rows are passed as tuple.
+
+        Beware, this is slow.
+
+        Parameters
+        ----------
+        f
+            Custom function/ lambda function
+        output_type
+            Output type of the operation. If none given, Polars tries to infer the type.
+        """
+        return wrap_s(self._df.apply(f, output_type))
+
+    def with_column(self, column: "Union[Series, Expr]") -> "DataFrame":
+        """
+        Return a new DataFrame with the column added or replaced
+
+        Parameters
+        ----------
+        column
+            Series, where the name of the Series refers to the column in the DataFrame.
+        """
+        # is Expr
+        if hasattr(column, "_pyexpr"):
+            return self.with_columns([column])
+        return wrap_df(self._df.with_column(column._s))
 
     def hstack(
         self, columns: "Union[List[Series], DataFrame]", in_place=False
@@ -1002,7 +1284,7 @@ class DataFrame:
         else:
             return wrap_df(self._df.hstack([s.inner() for s in columns]))
 
-    def vstack(self, df: "DataFrame", in_place: bool = False):
+    def vstack(self, df: "DataFrame", in_place: bool = False) -> Optional["DataFrame"]:
         """
         Grow this DataFrame vertically by stacking a DataFrame to it.
 
@@ -1166,6 +1448,26 @@ class DataFrame:
         """
         return wrap_df(self._df.shift(periods))
 
+    def shift_and_fill(
+        self, periods: int, fill_value: Union[int, str, float]
+    ) -> "DataFrame":
+        """
+        Shift the values by a given period and fill the parts that will be empty due to this operation
+        with the result of the `fill_value` expression.
+
+        Parameters
+        ----------
+        periods
+            Number of places to shift (may be negative).
+        fill_value
+            fill None values with this value.
+        """
+        return (
+            self.lazy()
+            .shift_and_fill(periods, fill_value)
+            .collect(no_optimization=True, string_cache=False)
+        )
+
     def is_duplicated(self) -> Series:
         """
         Get a mask of all duplicated rows in this DataFrame
@@ -1178,7 +1480,7 @@ class DataFrame:
         """
         return wrap_s(self._df.is_unique())
 
-    def lazy(self) -> "polars.lazy.LazyFrame":
+    def lazy(self) -> "LazyFrame":
         """
         Start a lazy query from this point. This returns a `LazyFrame` object.
 
@@ -1190,11 +1492,39 @@ class DataFrame:
         * `.describe_optimized_plan()` (print optimized query plan)
         * `.show_graph()` (show (un)optimized query plan) as graphiz graph.
 
-        Lazy operations are advised because the allow for query optimization and more parallelization.
+        Lazy operations are advised because they allow for query optimization and more parallelization.
         """
         from polars.lazy import wrap_ldf
 
         return wrap_ldf(self._df.lazy())
+
+    def select(self, exprs: "Union[str, Expr, List[str], List[Expr]]") -> "DataFrame":
+        """
+        Select columns from this DataFrame
+
+        Parameters
+        ----------
+        exprs
+            Column or columns to select
+        """
+        return (
+            self.lazy().select(exprs).collect(no_optimization=True, string_cache=False)
+        )
+
+    def with_columns(self, exprs: "List[Expr]") -> "DataFrame":
+        """
+        Add or overwrite multiple columns in a DataFrame
+
+        Parameters
+        ----------
+        exprs
+            List of Expressions that evaluate to columns
+        """
+        return (
+            self.lazy()
+            .with_columns(exprs)
+            .collect(no_optimization=True, string_cache=False)
+        )
 
     def n_chunks(self) -> int:
         """
@@ -1202,29 +1532,45 @@ class DataFrame:
         """
         return self._df.n_chunks()
 
-    def max(self) -> "DataFrame":
+    def max(self, axis: int = 0) -> "DataFrame":
         """
         Aggregate the columns of this DataFrame to their maximum value
         """
-        return wrap_df(self._df.max())
+        if axis == 0:
+            return wrap_df(self._df.max())
+        if axis == 1:
+            return wrap_s(self._df.hmax()).to_frame()
+        raise ValueError("axis should be 0 or 1")
 
-    def min(self) -> "DataFrame":
+    def min(self, axis: int = 0) -> "DataFrame":
         """
         Aggregate the columns of this DataFrame to their minimum value
         """
-        return wrap_df(self._df.min())
+        if axis == 0:
+            return wrap_df(self._df.min())
+        if axis == 1:
+            return wrap_s(self._df.hmin()).to_frame()
+        raise ValueError("axis should be 0 or 1")
 
-    def sum(self) -> "DataFrame":
+    def sum(self, axis: int = 0) -> "DataFrame":
         """
         Aggregate the columns of this DataFrame to their sum value
         """
-        return wrap_df(self._df.sum())
+        if axis == 0:
+            return wrap_df(self._df.sum())
+        if axis == 1:
+            return wrap_s(self._df.hsum()).to_frame()
+        raise ValueError("axis should be 0 or 1")
 
-    def mean(self) -> "DataFrame":
+    def mean(self, axis: int = 0) -> "DataFrame":
         """
         Aggregate the columns of this DataFrame to their mean value
         """
-        return wrap_df(self._df.mean())
+        if axis == 0:
+            return wrap_df(self._df.mean())
+        if axis == 1:
+            return wrap_s(self._df.hmean()).to_frame()
+        raise ValueError("axis should be 0 or 1")
 
     def std(self) -> "DataFrame":
         """
@@ -1303,11 +1649,108 @@ class DataFrame:
             return wrap_df(self._df.sample_n(n, with_replacement))
         return wrap_df(self._df.sample_frac(frac, with_replacement))
 
+    def fold(self, operation: "Callable[['Series', 'Series'], 'Series']") -> "Series":
+        """
+        Apply a horizontal reduction on a DataFrame. This can be used to effectively
+        determine aggregations on a row level, and can be applied to any DataType that
+        can be supercasted (casted to a similar parent type).
+
+        An example of the supercast rules when applying an arithmetic operation on two DataTypes are for instance:
+
+        Int8 + Utf8 = Utf8
+        Float32 + Int64 = Float32
+        Float32 + Float64 = Float64
+
+        # Examples
+
+        ## A horizontal sum operation
+        ```python
+        >>> df = pl.DataFrame(
+            {"a": [2, 1, 3],
+            "b": [1, 2, 3],
+            "c": [1.0, 2.0, 3.0]
+        })
+
+        >>> df.fold(lambda s1, s2: s1 + s2)
+        ```
+        ```text
+        Series: 'a' [f64]
+        [
+            4
+            5
+            9
+        ]
+        ```
+
+        ## A horizontal minimum operation
+
+        ```python
+        >>> df = pl.DataFrame(
+            {"a": [2, 1, 3],
+            "b": [1, 2, 3],
+            "c": [1.0, 2.0, 3.0]
+        })
+
+        >>> df.fold(lambda s1, s2: s1.zip_with(s1 < s2, s2))
+        ```
+        ```text
+        Series: 'a' [f64]
+        [
+            1
+            1
+            3
+        ]
+        ```
+
+        ## A horizontal string concattenation
+        ```python
+        >>> df = pl.DataFrame(
+            {"a": ["foo", "bar", 2],
+            "b": [1, 2, 3],
+            "c": [1.0, 2.0, 3.0]
+        })
+
+        >>> df.fold(lambda s1, s2: s1 + s2)
+        ```
+        ```text
+        Series: '' [f64]
+        [
+            "foo11"
+            "bar22
+            "233"
+        ]
+        ```
+
+        Parameters
+        ----------
+        operation
+            function that takes two `Series` and returns a `Series`
+        """
+        if self.width == 1:
+            return self
+        df = self
+        acc = operation(df[0], df[1])
+
+        for i in range(2, df.width):
+            acc = operation(acc, df[i])
+        return acc
+
+    def row(self, index: int) -> Tuple[Any]:
+        """
+        Get a row as tuple
+
+        Parameters
+        ----------
+        index
+            Row index
+        """
+        return self._df.row_tuple(index)
+
 
 class GroupBy:
     def __init__(
         self,
-        df: DataFrame,
+        df: "PyDataFrame",
         by: "List[str]",
         downsample: bool = False,
         rule=None,
@@ -1318,6 +1761,47 @@ class GroupBy:
         self.downsample = downsample
         self.rule = rule
         self.downsample_n = downsample_n
+
+    def __getitem__(self, item):
+        return self.select(item)
+
+    def __iter__(self):
+        groups_df = self.groups()
+        groups = groups_df["groups"]
+        df = wrap_df(self._df)
+        for i in range(groups_df.height):
+            yield df[groups[i]]
+
+    def get_group(self, group_value: "Union[Any, Tuple[Any]]") -> DataFrame:
+        groups_df = self.groups()
+        groups = groups_df["groups"]
+
+        if not isinstance(group_value, list):
+            group_value = [group_value]
+
+        by = self.by
+        if not isinstance(by, list):
+            by = [by]
+
+        mask = None
+        for column, group_val in zip(by, group_value):
+            local_mask = groups_df[column] == group_val
+            if mask is None:
+                mask = local_mask
+            else:
+                mask = mask & local_mask
+
+        # should be only one match
+        try:
+            groups_idx = groups[mask][0]
+        except IndexError:
+            raise ValueError(f"no group: {group_value} found")
+
+        df = wrap_df(self._df)
+        return df[groups_idx]
+
+    def groups(self) -> DataFrame:
+        return wrap_df(self._df.groupby(self.by, None, "groups"))
 
     def apply(self, f: "Callable[[DataFrame], DataFrame]"):
         """
@@ -1335,10 +1819,11 @@ class GroupBy:
         return wrap_df(self._df.groupby_apply(self.by, f))
 
     def agg(
-        self, column_to_agg: "Union[List[Tuple[str, List[str]]], Dict[str, List[str]]]"
+        self,
+        column_to_agg: "Union[List[Tuple[str, List[str]]], Dict[str, List[str]]], List[Expr]",
     ) -> DataFrame:
         """
-        Use multiple aggregations on columns
+        Use multiple aggregations on columns. This can be combined with complete lazy API.
 
         Parameters
         ----------
@@ -1346,26 +1831,68 @@ class GroupBy:
             map column to aggregation functions
 
             Examples:
+                ## column name to aggregation with tuples:
                 [("foo", ["sum", "n_unique", "min"]),
                  ("bar": ["max"])]
 
+                ## column name to aggregation with dict:
                 {"foo": ["sum", "n_unique", "min"],
                 "bar": "max" }
+
+                ## use lazy API syntax
+                [col("foo").sum(), col("bar").min()]
 
         Returns
         -------
         Result of groupby split apply operations.
+
+
+        # Example
+
+        ```python
+
+        # use lazy API
+        (df.groupby(["foo", "bar])
+            .agg([pl.sum("ham"), col("spam").tail(4).sum()])
+
+        # use a dict
+        (df.groupby(["foo", "bar])
+            .agg({"spam": ["sum", "min"})
+        ```
         """
         if isinstance(column_to_agg, dict):
             column_to_agg = [
                 (column, [agg] if isinstance(agg, str) else agg)
                 for (column, agg) in column_to_agg.items()
             ]
+        elif isinstance(column_to_agg, list):
+            from .lazy import Expr
+
+            if isinstance(column_to_agg[0], tuple):
+                column_to_agg = [
+                    (column, [agg] if isinstance(agg, str) else agg)
+                    for (column, agg) in column_to_agg
+                ]
+
+            elif isinstance(column_to_agg[0], Expr):
+                return (
+                    wrap_df(self._df)
+                    .lazy()
+                    .groupby(self.by)
+                    .agg(column_to_agg)
+                    .collect(no_optimization=True, string_cache=False)
+                )
+
+                pass
+            else:
+                raise ValueError(
+                    f"argument: {column_to_agg} not understood, have you passed a list of expressions?"
+                )
         else:
-            column_to_agg = [
-                (column, [agg] if isinstance(agg, str) else agg)
-                for (column, agg) in column_to_agg
-            ]
+            raise ValueError(
+                f"argument: {column_to_agg} not understood, have you passed a list of expressions?"
+            )
+
         if self.downsample:
             return wrap_df(
                 self._df.downsample_agg(
@@ -1654,7 +2181,7 @@ class GBSelection:
 
     def apply(
         self,
-        func: "Union[Callable[['T'], 'T'], Callable[['T'], 'S']]",
+        func: "Union[Callable[['Any'], 'Any'], Callable[['Any'], 'Any']]",
         dtype_out: "Optional['DataType']" = None,
     ) -> "DataFrame":
         """
@@ -1673,6 +2200,13 @@ class GBSelection:
         return df
 
 
+def _series_to_frame(self: "Series") -> "DataFrame":
+    return wrap_df(PyDataFrame([self._s]))
+
+
+Series.to_frame = _series_to_frame
+
+
 class StringCache:
     """
     Context manager that allows to data sources to share the same categorical features.
@@ -1684,8 +2218,16 @@ class StringCache:
         pass
 
     def __enter__(self):
-        toggle_string_cache(True)
+        pytoggle_string_cache(True)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        toggle_string_cache(False)
+        pytoggle_string_cache(False)
+
+
+def toggle_string_cache(toggle: bool):
+    """
+    Turn on/off the global string cache. This ensures that casts to Categorical types have the categories when string
+    values are equal
+    """
+    pytoggle_string_cache(toggle)

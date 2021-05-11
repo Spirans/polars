@@ -2,7 +2,7 @@
 
 /// Implement all parallel iterators and producers for a given chunked array. It also implements the
 /// `IntoParallelIterator` trait for `ca_type` and for `NoNull<ca_type>`.
-/// It will implement and iterator and a producer for the followin chunke arrays:
+/// It will implement and iterator and a producer for the following chunke arrays:
 /// - Chunked arrays with one chunk without null value, which returns the value wrapped in an `Option`.
 /// - Chunked arrays with one chunk with null values, which returns the value wrapped in an `Option`.
 /// - Chunked arrays with many chunks without null value, which returns the value wrapped in an `Option`.
@@ -94,7 +94,7 @@ macro_rules! impl_all_parallel_iterators {
         // The methods are the same for the `ReturnOption` and `ReturnUnwrap` variant.
         impl<$( $lifetime )?> $seq_iter_single_chunk {
             fn from_parts(ca: $ca_type, offset: usize, len: usize) -> Self {
-                let chunks = ca.downcast_chunks();
+                let chunks = ca.downcast_iter();
                 let current_array = chunks[0];
                 let idx_left = offset;
                 let idx_right = offset + len;
@@ -110,7 +110,7 @@ macro_rules! impl_all_parallel_iterators {
         impl<$( $lifetime )?> $seq_iter_many_chunk {
             fn from_parts(ca: $ca_type, offset: usize, len: usize) -> Self {
                 let ca = ca;
-                let chunks = ca.downcast_chunks();
+                let chunks = ca.downcast_iter();
                 let idx_left = offset;
                 let (chunk_idx_left, current_array_idx_left) = ca.index_to_chunked_index(idx_left);
                 let current_array_left = chunks[chunk_idx_left];
@@ -190,7 +190,7 @@ macro_rules! impl_all_parallel_iterators {
             for $seq_iter_single_chunk_null_check
         {
             fn from(prod: $producer_single_chunk_null_check_return_option<$( $lifetime )?>) -> Self {
-                let chunks = prod.ca.downcast_chunks();
+                let chunks = prod.ca.downcast_iter();
                 let current_array = chunks[0];
                 let current_data = current_array.data();
                 let idx_left = prod.offset;
@@ -270,7 +270,7 @@ macro_rules! impl_all_parallel_iterators {
         {
             fn from(prod: $producer_many_chunk_null_check_return_option<$( $lifetime )?>) -> Self {
                 let ca = prod.ca;
-                let chunks = ca.downcast_chunks();
+                let chunks = ca.downcast_iter();
 
                 // Compute left chunk indexes.
                 let idx_left = prod.offset;
@@ -554,7 +554,7 @@ macro_rules! impl_into_par_iter {
             type Item = Option<$iter_item>;
 
             fn into_par_iter(self) -> Self::Iter {
-                let chunks = self.downcast_chunks();
+                let chunks = self.downcast_iter();
                 match chunks.len() {
                     1 => {
                         if self.null_count() == 0 {
@@ -688,7 +688,7 @@ macro_rules! impl_into_no_null_par_iter {
 
             fn into_par_iter(self) -> Self::Iter {
                 let ca = self.0;
-                let chunks = ca.downcast_chunks();
+                let chunks = ca.downcast_iter();
                 match chunks.len() {
                     1 => $dispatcher::SingleChunk(
                         <$single_chunk_return_unwrapped>::new(ca),

@@ -1,7 +1,10 @@
 .idea/
+.vscode/
 target/
 Cargo.lock
 data/
 __pycache__/
 .ipynb_checkpoints/
 polars/vendor
+*.so
+.ENV

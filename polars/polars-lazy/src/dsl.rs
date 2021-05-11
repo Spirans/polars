@@ -1,12 +1,8 @@
 //! Domain specific language for the Lazy api.
 use crate::logical_plan::Context;
 use crate::prelude::*;
-use crate::utils::{output_name, rename_field};
-use polars_core::{
-    frame::group_by::{fmt_groupby_column, GroupByMethod},
-    prelude::*,
-    utils::get_supertype,
-};
+use crate::utils::{has_expr, output_name};
+use polars_core::prelude::*;
 
 #[cfg(feature = "temporal")]
 use polars_core::utils::chrono::{NaiveDate, NaiveDateTime};
@@ -170,7 +166,6 @@ pub enum Expr {
         op: Operator,
         right: Box<Expr>,
     },
-    // Nested(Box<Expr>),
     Not(Box<Expr>),
     IsNotNull(Box<Expr>),
     IsNull(Box<Expr>),
@@ -182,7 +177,18 @@ pub enum Expr {
         expr: Box<Expr>,
         reverse: bool,
     },
+    Take {
+        expr: Box<Expr>,
+        idx: Box<Expr>,
+    },
+    SortBy {
+        expr: Box<Expr>,
+        by: Box<Expr>,
+        reverse: bool,
+    },
     Agg(AggExpr),
+    /// A ternary operation
+    /// if true then "foo" else "bar"
     Ternary {
         predicate: Box<Expr>,
         truthy: Box<Expr>,
@@ -199,8 +205,12 @@ pub enum Expr {
     },
     Reverse(Box<Expr>),
     Duplicated(Box<Expr>),
-    Unique(Box<Expr>),
+    IsUnique(Box<Expr>),
     Explode(Box<Expr>),
+    Filter {
+        input: Box<Expr>,
+        by: Box<Expr>,
+    },
     /// See postgres window functions
     Window {
         /// Also has the input. i.e. avg("foo")
@@ -212,7 +222,7 @@ pub enum Expr {
     Slice {
         input: Box<Expr>,
         /// length is not yet known so we accept negative offsets
-        offset: isize,
+        offset: i64,
         length: usize,
     },
     BinaryFunction {
@@ -227,181 +237,12 @@ pub enum Expr {
 }
 
 impl Expr {
-    /// Get DataType result of the expression. The schema is the input data.
-    pub fn get_type(&self, schema: &Schema, context: Context) -> Result<DataType> {
-        self.to_field(schema, context)
-            .map(|f| f.data_type().clone())
-    }
-
     /// Get Field result of the expression. The schema is the input data.
     pub(crate) fn to_field(&self, schema: &Schema, ctxt: Context) -> Result<Field> {
-        use Expr::*;
-        match self {
-            Window { function, .. } => function.to_field(schema, ctxt),
-            Unique(expr) => {
-                let field = expr.to_field(&schema, ctxt)?;
-                Ok(Field::new(field.name(), DataType::Boolean))
-            }
-            Duplicated(expr) => {
-                let field = expr.to_field(&schema, ctxt)?;
-                Ok(Field::new(field.name(), DataType::Boolean))
-            }
-            Reverse(expr) => expr.to_field(&schema, ctxt),
-            Explode(expr) => expr.to_field(&schema, ctxt),
-            Alias(expr, name) => Ok(Field::new(name, expr.get_type(schema, ctxt)?)),
-            Column(name) => {
-                let field = schema.field_with_name(name).map(|f| f.clone())?;
-                Ok(field)
-            }
-            Literal(sv) => Ok(Field::new("lit", sv.get_datatype())),
-            BinaryExpr { left, right, op } => {
-                let left_type = left.get_type(schema, ctxt)?;
-                let right_type = right.get_type(schema, ctxt)?;
-
-                let expr_type = match op {
-                    Operator::Not
-                    | Operator::Lt
-                    | Operator::Gt
-                    | Operator::Eq
-                    | Operator::NotEq
-                    | Operator::And
-                    | Operator::LtEq
-                    | Operator::GtEq
-                    | Operator::Or
-                    | Operator::NotLike
-                    | Operator::Like => DataType::Boolean,
-                    _ => get_supertype(&left_type, &right_type)?,
-                };
-
-                use Operator::*;
-                let out_field;
-                let out_name = match op {
-                    Plus | Minus | Multiply | Divide | Modulus => {
-                        out_field = left.to_field(schema, ctxt)?;
-                        out_field.name().as_str()
-                    }
-                    Eq | Lt | GtEq | LtEq => "",
-                    _ => "binary_expr",
-                };
-
-                Ok(Field::new(out_name, expr_type))
-            }
-            Not(_) => Ok(Field::new("not", DataType::Boolean)),
-            IsNull(_) => Ok(Field::new("is_null", DataType::Boolean)),
-            IsNotNull(_) => Ok(Field::new("is_not_null", DataType::Boolean)),
-            Sort { expr, .. } => expr.to_field(schema, ctxt),
-            Agg(agg) => {
-                use AggExpr::*;
-                let field = match agg {
-                    Min(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::Min)
-                    }
-                    Max(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::Max)
-                    }
-                    Median(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::Median)
-                    }
-                    Mean(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::Mean)
-                    }
-                    First(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::First)
-                    }
-                    Last(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::Last)
-                    }
-                    List(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::List)
-                    }
-                    NUnique(expr) => {
-                        let field = expr.to_field(schema, ctxt)?;
-                        let field = Field::new(field.name(), DataType::UInt32);
-                        match ctxt {
-                            Context::Other => field,
-                            Context::Aggregation => {
-                                let new_name =
-                                    fmt_groupby_column(field.name(), GroupByMethod::NUnique);
-                                rename_field(&field, &new_name)
-                            }
-                        }
-                    }
-                    Sum(expr) => {
-                        field_by_context(expr.to_field(schema, ctxt)?, ctxt, GroupByMethod::Sum)
-                    }
-                    Std(expr) => {
-                        let field = expr.to_field(schema, ctxt)?;
-                        let field = Field::new(field.name(), DataType::Float64);
-                        field_by_context(field, ctxt, GroupByMethod::Std)
-                    }
-                    Var(expr) => {
-                        let field = expr.to_field(schema, ctxt)?;
-                        let field = Field::new(field.name(), DataType::Float64);
-                        field_by_context(field, ctxt, GroupByMethod::Var)
-                    }
-                    Count(expr) => {
-                        let field = expr.to_field(schema, ctxt)?;
-                        let field = Field::new(field.name(), DataType::UInt32);
-                        match ctxt {
-                            Context::Other => field,
-                            Context::Aggregation => {
-                                let new_name =
-                                    fmt_groupby_column(field.name(), GroupByMethod::Count);
-                                rename_field(&field, &new_name)
-                            }
-                        }
-                    }
-                    AggGroups(expr) => {
-                        let field = expr.to_field(schema, ctxt)?;
-                        let new_name = fmt_groupby_column(field.name(), GroupByMethod::Groups);
-                        Field::new(&new_name, DataType::List(ArrowDataType::UInt32))
-                    }
-                    Quantile { expr, quantile } => field_by_context(
-                        expr.to_field(schema, ctxt)?,
-                        ctxt,
-                        GroupByMethod::Quantile(*quantile),
-                    ),
-                };
-                Ok(field)
-            }
-            Cast { expr, data_type } => {
-                let field = expr.to_field(schema, ctxt)?;
-                Ok(Field::new(field.name(), data_type.clone()))
-            }
-            Ternary { truthy, .. } => truthy.to_field(schema, ctxt),
-            Udf {
-                output_type, input, ..
-            } => match output_type {
-                None => input.to_field(schema, ctxt),
-                Some(output_type) => {
-                    let input_field = input.to_field(schema, ctxt)?;
-                    Ok(Field::new(input_field.name(), output_type.clone()))
-                }
-            },
-            BinaryFunction {
-                input_a,
-                input_b,
-                output_field,
-                ..
-            } => {
-                let field_a = input_a.to_field(schema, ctxt)?;
-                let field_b = input_b.to_field(schema, ctxt)?;
-                // if field is unknown we try to guess a return type. May fail.
-                Ok(output_field
-                    .get_field(schema, ctxt, &field_a, &field_b)
-                    .unwrap_or_else(|| {
-                        Field::new(
-                            "binary_expr",
-                            get_supertype(field_a.data_type(), field_b.data_type())
-                                .unwrap_or(DataType::Null),
-                        )
-                    }))
-            }
-            Shift { input, .. } => input.to_field(schema, ctxt),
-            Slice { input, .. } => input.to_field(schema, ctxt),
-            Wildcard => panic!("should be no wildcard at this point"),
-            Except(_) => panic!("should be no except at this point"),
-        }
+        // this is not called much and th expression depth is typically shallow
+        let mut arena = Arena::with_capacity(5);
+        let root = to_aexpr(self.clone(), &mut arena);
+        arena.get(root).to_field(schema, ctxt, &arena)
     }
 }
 
@@ -415,10 +256,10 @@ impl fmt::Debug for Expr {
                 order_by,
             } => write!(
                 f,
-                "{:?} OVER (PARTION BY {:?} ORDER BY {:?}",
+                "{:?} OVER (PARTITION BY {:?} ORDER BY {:?}",
                 function, partition_by, order_by
             ),
-            Unique(expr) => write!(f, "UNIQUE {:?}", expr),
+            IsUnique(expr) => write!(f, "UNIQUE {:?}", expr),
             Explode(expr) => write!(f, "EXPLODE {:?}", expr),
             Duplicated(expr) => write!(f, "DUPLICATED {:?}", expr),
             Reverse(expr) => write!(f, "REVERSE {:?}", expr),
@@ -433,6 +274,16 @@ impl fmt::Debug for Expr {
                 true => write!(f, "{:?} DESC", expr),
                 false => write!(f, "{:?} ASC", expr),
             },
+            SortBy { expr, by, reverse } => match reverse {
+                true => write!(f, "{:?} DESC BY {:?}", expr, by),
+                false => write!(f, "{:?} ASC BY {:?}", expr, by),
+            },
+            Filter { input, by } => {
+                write!(f, "FILTER {:?} BY {:?}", input, by)
+            }
+            Take { expr, idx } => {
+                write!(f, "TAKE {:?} AT {:?}", expr, idx)
+            }
             Agg(agg) => {
                 use AggExpr::*;
                 match agg {
@@ -516,9 +367,6 @@ pub enum Operator {
     Modulus,
     And,
     Or,
-    Not,
-    Like,
-    NotLike,
 }
 
 pub fn binary_expr(l: Expr, op: Operator, r: Expr) -> Expr {
@@ -689,7 +537,7 @@ impl Expr {
     }
 
     /// Slice the Series.
-    pub fn slice(self, offset: isize, length: usize) -> Self {
+    pub fn slice(self, offset: i64, length: usize) -> Self {
         Expr::Slice {
             input: Box::new(self),
             offset,
@@ -705,7 +553,26 @@ impl Expr {
     /// Get the last `n` elements of the Expr result
     pub fn tail(self, length: Option<usize>) -> Self {
         let len = length.unwrap_or(10);
-        self.slice(-(len as isize), len)
+        self.slice(-(len as i64), len)
+    }
+
+    /// Get unique values of this expression.
+    pub fn unique(self) -> Self {
+        if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
+            panic!("wildcard not supperted in unique expr");
+        }
+        self.map(|s: Series| s.unique(), None)
+    }
+
+    /// Get the first index of unique values of this expression.
+    pub fn arg_unique(self) -> Self {
+        if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
+            panic!("wildcard not supported in unique expr");
+        }
+        self.map(
+            |s: Series| s.arg_unique().map(|ca| ca.into_series()),
+            Some(DataType::UInt32),
+        )
     }
 
     /// Cast expression to another data type.
@@ -716,7 +583,17 @@ impl Expr {
         }
     }
 
-    /// Sort expression. See [the eager implementation](polars_core::series::SeriesTrait::sort).
+    /// Take the values by idx.
+    pub fn take(self, idx: Expr) -> Self {
+        Expr::Take {
+            expr: Box::new(self),
+            idx: Box::new(idx),
+        }
+    }
+
+    /// Sort in increasing order. See [the eager implementation](polars_core::series::SeriesTrait::sort).
+    ///
+    /// Can be used in `default` and `aggregation` context.
     pub fn sort(self, reverse: bool) -> Self {
         Expr::Sort {
             expr: Box::new(self),
@@ -936,7 +813,7 @@ impl Expr {
     /// Get a mask of unique values
     #[allow(clippy::wrong_self_convention)]
     pub fn is_unique(self) -> Self {
-        Expr::Unique(Box::new(self))
+        Expr::IsUnique(Box::new(self))
     }
 
     /// and operation
@@ -954,55 +831,97 @@ impl Expr {
         self.map(move |s: Series| s.pow(exponent), Some(DataType::Float64))
     }
 
+    /// Filter a single column
+    /// Should be used in aggregation context. If you want to filter on a DataFrame level, use
+    /// [LazyFrame::filter](LazyFrame::filter)
+    pub fn filter(self, predicate: Expr) -> Self {
+        if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
+            panic!("filter '*' not allowed, use LazyFrame::filter")
+        };
+        Expr::Filter {
+            input: Box::new(self),
+            by: Box::new(predicate),
+        }
+    }
+
+    /// Check if the values of the left expression are in the lists of the right expr.
+    #[allow(clippy::wrong_self_convention)]
+    #[cfg(feature = "is_in")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "is_in")))]
+    pub fn is_in(self, other: Expr) -> Self {
+        map_binary(
+            self,
+            other,
+            |left, other| {
+                left.is_in(&other).map(|ca| {
+                    let mut s = ca.into_series();
+                    s.rename(left.name());
+                    s
+                })
+            },
+            Some(Field::new("", DataType::Boolean)),
+        )
+    }
+
     /// Get the year of a Date32/Date64
     #[cfg(feature = "temporal")]
     pub fn year(self) -> Expr {
-        let function = move |s: Series| s.year();
+        let function = move |s: Series| s.year().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
     }
 
     /// Get the month of a Date32/Date64
     #[cfg(feature = "temporal")]
     pub fn month(self) -> Expr {
-        let function = move |s: Series| s.month();
+        let function = move |s: Series| s.month().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
     }
     /// Get the month of a Date32/Date64
     #[cfg(feature = "temporal")]
     pub fn day(self) -> Expr {
-        let function = move |s: Series| s.day();
+        let function = move |s: Series| s.day().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
     }
     /// Get the ordinal_day of a Date32/Date64
     #[cfg(feature = "temporal")]
     pub fn ordinal_day(self) -> Expr {
-        let function = move |s: Series| s.ordinal_day();
+        let function = move |s: Series| s.ordinal_day().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
     }
     /// Get the hour of a Date64/Time64
     #[cfg(feature = "temporal")]
     pub fn hour(self) -> Expr {
-        let function = move |s: Series| s.hour();
+        let function = move |s: Series| s.hour().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
     }
     /// Get the minute of a Date64/Time64
     #[cfg(feature = "temporal")]
     pub fn minute(self) -> Expr {
-        let function = move |s: Series| s.minute();
+        let function = move |s: Series| s.minute().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
     }
 
     /// Get the second of a Date64/Time64
     #[cfg(feature = "temporal")]
     pub fn second(self) -> Expr {
-        let function = move |s: Series| s.second();
+        let function = move |s: Series| s.second().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
     }
     /// Get the nanosecond of a Time64
     #[cfg(feature = "temporal")]
     pub fn nanosecond(self) -> Expr {
-        let function = move |s: Series| s.nanosecond();
+        let function = move |s: Series| s.nanosecond().map(|ca| ca.into_series());
         self.map(function, Some(DataType::UInt32))
+    }
+
+    /// Sort this column by the ordering of another column.
+    /// Can also be used in a groupby context to sort the groups.
+    pub fn sort_by(self, by: Expr, reverse: bool) -> Expr {
+        Expr::SortBy {
+            expr: Box::new(self),
+            by: Box::new(by),
+            reverse,
+        }
     }
 }
 
@@ -1174,10 +1093,22 @@ make_literal!(i8, Int8);
 make_literal!(i16, Int16);
 make_literal!(i32, Int32);
 make_literal!(i64, Int64);
+#[cfg(feature = "dtype-u8")]
 make_literal!(u8, UInt8);
+#[cfg(feature = "dtype-u16")]
 make_literal!(u16, UInt16);
 make_literal!(u32, UInt32);
+#[cfg(feature = "dtype-u64")]
 make_literal!(u64, UInt64);
+
+/// The literal Null
+pub struct Null {}
+
+impl Literal for Null {
+    fn lit(self) -> Expr {
+        Expr::Literal(LiteralValue::Null)
+    }
+}
 
 #[cfg(all(feature = "temporal", feature = "dtype-date64"))]
 impl Literal for NaiveDateTime {
@@ -1190,6 +1121,12 @@ impl Literal for NaiveDateTime {
 impl Literal for NaiveDate {
     fn lit(self) -> Expr {
         Expr::Literal(LiteralValue::DateTime(self.and_hms(0, 0, 0)))
+    }
+}
+
+impl Literal for Series {
+    fn lit(self) -> Expr {
+        Expr::Literal(LiteralValue::Series(NoEq::new(self)))
     }
 }
 
@@ -1286,5 +1223,32 @@ impl Rem for Expr {
 
     fn rem(self, rhs: Self) -> Self::Output {
         binary_expr(self, Operator::Modulus, rhs)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use polars_core::df;
+    use polars_core::prelude::*;
+
+    #[test]
+    #[cfg(feature = "is_in")]
+    fn test_is_in() -> Result<()> {
+        let df = df![
+            "x" => [1, 2, 3],
+            "y" => ["a", "b", "c"]
+        ]?;
+        let s = Series::new("a", ["a", "b"]);
+
+        let out = df
+            .lazy()
+            .select([col("y").is_in(lit(s)).alias("isin")])
+            .collect()?;
+        assert_eq!(
+            Vec::from(out.column("isin")?.bool()?),
+            &[Some(true), Some(true), Some(false)]
+        );
+        Ok(())
     }
 }

@@ -62,8 +62,11 @@ where
             if let Some(value) = value {
                 // fast path uses kernel
                 if self.chunks.len() == 1 {
-                    let arr =
-                        set_at_idx_no_null(self.downcast_chunks()[0], idx.into_iter(), value)?;
+                    let arr = set_at_idx_no_null(
+                        self.downcast_iter().next().unwrap(),
+                        idx.into_iter(),
+                        value,
+                    )?;
                     return Ok(Self::new_from_chunks(self.name(), vec![Arc::new(arr)]));
                 }
                 // Other fast path. Slightly slower as it does not do a memcpy
@@ -107,9 +110,9 @@ where
 
                 // apply binary kernel.
                 let chunks = left
-                    .downcast_chunks()
+                    .downcast_iter()
                     .into_iter()
-                    .zip(mask.downcast_chunks())
+                    .zip(mask.downcast_iter())
                     .map(|(arr, mask)| {
                         let a = set_with_mask(arr, mask, value);
                         Arc::new(a) as ArrayRef
