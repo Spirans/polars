@@ -164,7 +164,7 @@ macro_rules! set_limit {
 
 impl<T> Debug for ChunkedArray<T>
 where
-    T: PolarsPrimitiveType,
+    T: PolarsNumericType,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let limit = set_limit!(self);
@@ -205,7 +205,7 @@ impl Debug for CategoricalChunked {
 #[cfg(feature = "object")]
 impl<T> Debug for ObjectChunked<T>
 where
-    T: 'static + Debug + Clone + Send + Sync + Default,
+    T: PolarsObject,
 {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let limit = set_limit!(self);
@@ -303,7 +303,9 @@ impl Debug for Series {
                 format_list_array!(limit, f, self.list().unwrap(), self.name(), "Series")
             }
             #[cfg(feature = "object")]
-            DataType::Object => format_object_array(limit, f, self.as_ref(), self.name(), "Series"),
+            DataType::Object(_) => {
+                format_object_array(limit, f, self.as_ref(), self.name(), "Series")
+            }
             DataType::Categorical => format_array!(
                 limit,
                 f,
@@ -583,7 +585,7 @@ pub(crate) trait FmtList {
 
 impl<T> FmtList for ChunkedArray<T>
 where
-    T: PolarsPrimitiveType,
+    T: PolarsNumericType,
     T::Native: fmt::Display,
 {
     fn fmt_list(&self) -> String {

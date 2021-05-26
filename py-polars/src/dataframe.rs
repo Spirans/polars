@@ -74,7 +74,7 @@ impl PyDataFrame {
         mut n_threads: Option<usize>,
         path: Option<String>,
         overwrite_dtype: Option<Vec<(&str, &PyAny)>>,
-        low_memory: bool
+        low_memory: bool,
     ) -> PyResult<Self> {
         let encoding = match encoding {
             "utf8" => CsvEncoding::Utf8,
@@ -284,6 +284,8 @@ impl PyDataFrame {
             "min" => FillNoneStrategy::Min,
             "max" => FillNoneStrategy::Max,
             "mean" => FillNoneStrategy::Mean,
+            "one" => FillNoneStrategy::One,
+            "zero" => FillNoneStrategy::Zero,
             s => return Err(PyPolarsEr::Other(format!("Strategy {} not supported", s)).into()),
         };
         let df = self.df.fill_none(strat).map_err(PyPolarsEr::from)?;

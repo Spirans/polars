@@ -1,3 +1,6 @@
+"""
+Module containing logic related to eager DataFrames
+"""
 from io import BytesIO
 
 try:
@@ -29,7 +32,7 @@ from .series import Series, wrap_s
 from . import datatypes
 from .datatypes import DataType, pytype_to_polars_type
 from ._html import NotebookFormatter
-from .utils import coerce_arrow
+from .utils import coerce_arrow, _is_expr
 import polars
 import pyarrow as pa
 import pyarrow.parquet
@@ -60,11 +63,11 @@ def _prepare_other_arg(other: Any) -> Series:
     return other
 
 
-def _is_expr(arg: Any) -> bool:
-    return hasattr(arg, "_pyexpr")
-
-
 class DataFrame:
+    """
+    A DataFrame is a two dimensional data structure that represents data as a table with rows and columns.
+    """
+
     def __init__(
         self,
         data: "Union[Dict[str, Sequence], List[Series], np.ndarray]",
@@ -280,7 +283,10 @@ class DataFrame:
     def to_arrow(self) -> pa.Table:
         """
         Collect the underlying arrow arrays in an Arrow Table.
-        This operation is zero copy.
+        This operation is mostly zero copy.
+
+        Data types that do copy:
+            - CategoricalType
         """
         record_batches = self._df.to_arrow()
         return pa.Table.from_batches(record_batches)
@@ -427,7 +433,9 @@ class DataFrame:
         numpy.ndarray
         ```
         """
-        return np.vstack([self[:, i].to_numpy() for i in range(self.width)]).T
+        return np.vstack(
+            [self.select_at_idx(i).to_numpy() for i in range(self.width)]
+        ).T
 
     def __mul__(self, other):
         other = _prepare_other_arg(other)
@@ -474,7 +482,16 @@ class DataFrame:
         """
         return self._df.find_idx_by_name(name)
 
+    def _pos_idx(self, idx, dim):
+        if idx >= 0:
+            return idx
+        else:
+            return self.shape[dim] + idx
+
     def __getitem__(self, item):
+        """
+        Does quite a lot. Read the comments.
+        """
         if hasattr(item, "_pyexpr"):
             return self.select(item)
         if isinstance(item, np.ndarray):
@@ -516,13 +533,29 @@ class DataFrame:
 
             # df[2, :] (select row as df)
             if isinstance(row_selection, int):
-                if isinstance(col_selection, slice):
+                if isinstance(col_selection, (slice, list, np.ndarray)):
                     df = self[:, col_selection]
                     return df.slice(row_selection, 1)
+                # df[2, "a"]
+                if isinstance(col_selection, str):
+                    return self[col_selection][row_selection]
 
             # column selection can be "a" and ["a", "b"]
             if isinstance(col_selection, str):
                 col_selection = [col_selection]
+
+            # df[:, 1]
+            if isinstance(col_selection, int):
+                series = self.select_at_idx(col_selection)
+                return series[row_selection]
+
+            if isinstance(col_selection, list):
+                # df[:, [1, 2]]
+                # select by column indexes
+                if isinstance(col_selection[0], int):
+                    series = [self.select_at_idx(i) for i in col_selection]
+                    df = DataFrame(series)
+                    return df[row_selection]
             df = self.__getitem__(col_selection)
             return df.__getitem__(row_selection)
 
@@ -533,7 +566,7 @@ class DataFrame:
 
         # df[idx]
         if isinstance(item, int):
-            return wrap_s(self._df.select_at_idx(item))
+            return self.slice(self._pos_idx(item, dim=0), 1)
 
         # df[:]
         if isinstance(item, slice):
@@ -572,7 +605,9 @@ class DataFrame:
                 if type(item[0]) == bool:
                     item = Series("", item)
                 else:
-                    return wrap_df(self._df.take(item))
+                    return wrap_df(
+                        self._df.take([self._pos_idx(i, dim=0) for i in item])
+                    )
             dtype = item.dtype
             if dtype == datatypes.Boolean:
                 return wrap_df(self._df.filter(item.inner()))
@@ -614,11 +649,29 @@ class DataFrame:
         return self.height
 
     def _repr_html_(self) -> str:
+        """
+        Used by jupyter notebooks to get a html table.
+
+        Output rows and columns can be modified by setting the following ENVIRONMENT variables:
+
+        * POLARS_FMT_MAX_COLS: set the number of columns
+        * POLARS_FMT_MAX_ROWS: set the number of rows
+        """
         max_cols = int(os.environ.get("POLARS_FMT_MAX_COLS", default=75))
         max_rows = int(os.environ.get("POLARS_FMT_MAX_rows", 25))
         return "\n".join(NotebookFormatter(self, max_cols, max_rows).render())
 
     def insert_at_idx(self, index: int, series: Series):
+        """
+        Insert a Series at a certain column index. This operation is in place.
+
+        Parameters
+        ----------
+        index
+            Column to insert the new `Series` column.
+        series
+            `Series` to insert.
+        """
         self._df.insert_at_idx(index, series._s)
 
     def filter(self, predicate: "Expr") -> "DataFrame":
@@ -718,6 +771,15 @@ class DataFrame:
 
     @columns.setter
     def columns(self, columns: "List[str]"):
+        """
+        Change the column names of the `DataFrame`
+
+        Parameters
+        ----------
+        columns
+            A list with new names for the `DataFrame`.
+            The length of the list should be equal to the widht of the `DataFrame`
+        """
         self._df.set_column_names(columns)
 
     @property
@@ -1234,7 +1296,9 @@ class DataFrame:
         return wrap_df(out)
 
     def apply(
-        self, f: "Callable[[Tuple[Any]], Any]", output_type: "Optional[DataType]" = None
+        self,
+        f: "Callable[[Tuple[Any]], Any]",
+        return_dtype: "Optional[DataType]" = None,
     ) -> "Series":
         """
         Apply a custom function over the rows of the DataFrame. The rows are passed as tuple.
@@ -1245,10 +1309,10 @@ class DataFrame:
         ----------
         f
             Custom function/ lambda function
-        output_type
+        return_dtype
             Output type of the operation. If none given, Polars tries to infer the type.
         """
-        return wrap_s(self._df.apply(f, output_type))
+        return wrap_s(self._df.apply(f, return_dtype))
 
     def with_column(self, column: "Union[Series, Expr]") -> "DataFrame":
         """
@@ -1259,8 +1323,7 @@ class DataFrame:
         column
             Series, where the name of the Series refers to the column in the DataFrame.
         """
-        # is Expr
-        if hasattr(column, "_pyexpr"):
+        if _is_expr(column):
             return self.with_columns([column])
         return wrap_df(self._df.with_column(column._s))
 
@@ -1376,23 +1439,33 @@ class DataFrame:
         """
         return list(map(lambda s: wrap_s(s), self._df.get_columns()))
 
-    def fill_none(self, strategy: str) -> "DataFrame":
+    def fill_none(self, strategy: "Union[str, Expr]") -> "DataFrame":
         """
-        Fill None values by a filling strategy.
+        Fill None values by a filling strategy or an Expression evaluation.
 
         Parameters
         ----------
         strategy
+            One of:
             - "backward"
             - "forward"
             - "mean"
             - "min'
             - "max"
+            - "zero"
+            - "one"
+            Or an expression.
 
         Returns
         -------
             DataFrame with None replaced with the filling strategy.
         """
+        if _is_expr(strategy):
+            return self.lazy().fill_none(strategy).collect()
+        if not isinstance(strategy, str):
+            from .lazy import lit
+
+            return self.fill_none(lit(strategy))
         return wrap_df(self._df.fill_none(strategy))
 
     def explode(self, columns: "Union[str, List[str]]") -> "DataFrame":
@@ -1520,6 +1593,8 @@ class DataFrame:
         exprs
             List of Expressions that evaluate to columns
         """
+        if not isinstance(exprs, list):
+            exprs = [exprs]
         return (
             self.lazy()
             .with_columns(exprs)
@@ -1729,10 +1804,10 @@ class DataFrame:
         if self.width == 1:
             return self
         df = self
-        acc = operation(df[0], df[1])
+        acc = operation(df.select_at_idx(0), df.select_at_idx(1))
 
         for i in range(2, df.width):
-            acc = operation(acc, df[i])
+            acc = operation(acc, df.select_at_idx(i))
         return acc
 
     def row(self, index: int) -> Tuple[Any]:
@@ -1748,6 +1823,17 @@ class DataFrame:
 
 
 class GroupBy:
+    """
+    Starts a new GroupBy operation.
+
+    You can also loop over this Object to loop over `DataFrames` with unique groups.
+
+    ```python
+    for group in df.groupby("foo"):
+        print(group)
+    ```
+    """
+
     def __init__(
         self,
         df: "PyDataFrame",
@@ -1773,6 +1859,13 @@ class GroupBy:
             yield df[groups[i]]
 
     def get_group(self, group_value: "Union[Any, Tuple[Any]]") -> DataFrame:
+        """
+        Select a single group as a new DataFrame.
+        Parameters
+        ----------
+        group_value
+            Group to select
+        """
         groups_df = self.groups()
         groups = groups_df["groups"]
 
@@ -1801,6 +1894,12 @@ class GroupBy:
         return df[groups_idx]
 
     def groups(self) -> DataFrame:
+        """
+        Return a `DataFrame` with:
+
+        * the groupby keys
+        * the group indexes aggregated as lists
+        """
         return wrap_df(self._df.groupby(self.by, None, "groups"))
 
     def apply(self, f: "Callable[[DataFrame], DataFrame]"):
@@ -1860,6 +1959,8 @@ class GroupBy:
             .agg({"spam": ["sum", "min"})
         ```
         """
+        if _is_expr(column_to_agg):
+            column_to_agg = [column_to_agg]
         if isinstance(column_to_agg, dict):
             column_to_agg = [
                 (column, [agg] if isinstance(agg, str) else agg)
@@ -2008,6 +2109,10 @@ class GroupBy:
 
 
 class PivotOps:
+    """
+    Utility class returned in a pivot operation.
+    """
+
     def __init__(
         self, df: DataFrame, by: "List[str]", pivot_column: str, values_column: str
     ):
@@ -2074,6 +2179,10 @@ class PivotOps:
 
 
 class GBSelection:
+    """
+    Utility class returned in a groupby operation.
+    """
+
     def __init__(
         self,
         df: DataFrame,
@@ -2182,7 +2291,7 @@ class GBSelection:
     def apply(
         self,
         func: "Union[Callable[['Any'], 'Any'], Callable[['Any'], 'Any']]",
-        dtype_out: "Optional['DataType']" = None,
+        return_dtype: "Optional['DataType']" = None,
     ) -> "DataFrame":
         """
         Apply a function over the groups
@@ -2193,7 +2302,7 @@ class GBSelection:
         else:
             selection = self.selection
         for name in selection:
-            s = df.drop_in_place(name + "_agg_list").apply(func, dtype_out)
+            s = df.drop_in_place(name + "_agg_list").apply(func, return_dtype)
             s.rename(name)
             df[name] = s
 
@@ -2211,7 +2320,6 @@ class StringCache:
     """
     Context manager that allows to data sources to share the same categorical features.
     This will temporarily cache the string categories until the context manager is finished.
-
     """
 
     def __init__(self):

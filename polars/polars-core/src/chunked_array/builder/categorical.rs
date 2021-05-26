@@ -164,10 +164,12 @@ impl CategoricalChunkedBuilder {
 #[cfg(test)]
 mod test {
     use crate::prelude::*;
-    use crate::toggle_string_cache;
+    use crate::{reset_string_cache, toggle_string_cache, SINGLE_LOCK};
 
     #[test]
     fn test_categorical_rev() -> Result<()> {
+        let _lock = SINGLE_LOCK.lock();
+        reset_string_cache();
         let ca = Utf8Chunked::new_from_opt_slice(
             "a",
             &[

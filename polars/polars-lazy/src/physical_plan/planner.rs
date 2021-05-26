@@ -5,7 +5,7 @@ use crate::utils::{aexpr_to_root_names, aexpr_to_root_nodes, agg_source_paths, h
 use ahash::RandomState;
 use itertools::Itertools;
 use polars_core::prelude::*;
-use polars_core::{frame::groupby::GroupByMethod, utils::parallel_op};
+use polars_core::{frame::groupby::GroupByMethod, utils::parallel_op_series};
 use polars_io::ScanAggregation;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -72,15 +72,15 @@ impl PhysicalPlanner for DefaultPlanner {
 }
 
 impl DefaultPlanner {
-    fn create_physical_expressions(
+    pub fn create_physical_expressions(
         &self,
-        exprs: Vec<Node>,
+        exprs: &[Node],
         context: Context,
         expr_arena: &mut Arena<AExpr>,
     ) -> Result<Vec<Arc<dyn PhysicalExpr>>> {
         exprs
-            .into_iter()
-            .map(|e| self.create_physical_expr(e, context, expr_arena))
+            .iter()
+            .map(|e| self.create_physical_expr(*e, context, expr_arena))
             .collect()
     }
     pub fn create_initial_physical_plan(
@@ -176,13 +176,13 @@ impl DefaultPlanner {
             Projection { expr, input, .. } => {
                 let input = self.create_initial_physical_plan(input, lp_arena, expr_arena)?;
                 let phys_expr =
-                    self.create_physical_expressions(expr, Context::Default, expr_arena)?;
+                    self.create_physical_expressions(&expr, Context::Default, expr_arena)?;
                 Ok(Box::new(StandardExec::new("projection", input, phys_expr)))
             }
             LocalProjection { expr, input, .. } => {
                 let input = self.create_initial_physical_plan(input, lp_arena, expr_arena)?;
                 let phys_expr =
-                    self.create_physical_expressions(expr, Context::Default, expr_arena)?;
+                    self.create_physical_expressions(&expr, Context::Default, expr_arena)?;
                 Ok(Box::new(StandardExec::new("projection", input, phys_expr)))
             }
             DataFrameScan {
@@ -196,7 +196,7 @@ impl DefaultPlanner {
                     .map_or(Ok(None), |v| v.map(Some))?;
                 let projection = projection
                     .map(|proj| {
-                        self.create_physical_expressions(proj, Context::Default, expr_arena)
+                        self.create_physical_expressions(&proj, Context::Default, expr_arena)
                     })
                     .map_or(Ok(None), |v| v.map(Some))?;
                 Ok(Box::new(DataFrameExec::new(df, projection, selection)))
@@ -208,7 +208,7 @@ impl DefaultPlanner {
             } => {
                 let input = self.create_initial_physical_plan(input, lp_arena, expr_arena)?;
                 let by_column =
-                    self.create_physical_expressions(by_column, Context::Default, expr_arena)?;
+                    self.create_physical_expressions(&by_column, Context::Default, expr_arena)?;
                 Ok(Box::new(SortExec {
                     input,
                     by_column,
@@ -260,8 +260,7 @@ impl DefaultPlanner {
                 // TODO: fix this brittle/ buggy state and implement partitioned groupby's in eager
                 let mut partitionable = true;
 
-                // currently only a single aggregation seems faster with ad-hoc partitioning.
-                if aggs.len() == 1 && keys.len() == 1 {
+                if keys.len() == 1 {
                     for agg in &aggs {
                         // make sure that we don't have a binary expr in the expr tree
                         let matches =
@@ -280,6 +279,7 @@ impl DefaultPlanner {
                             Expr::Agg(AggExpr::Min(_))
                             | Expr::Agg(AggExpr::Max(_))
                             | Expr::Agg(AggExpr::Sum(_))
+                            | Expr::Agg(AggExpr::Mean(_))
                             // first need to implement this correctly
                             // | Expr::Agg(AggExpr::Count(_))
                             | Expr::Agg(AggExpr::Last(_))
@@ -298,17 +298,14 @@ impl DefaultPlanner {
                 if apply.is_some() {
                     partitionable = false;
                 }
-                let phys_keys =
-                    self.create_physical_expressions(keys, Context::Default, expr_arena)?;
+                let mut phys_keys =
+                    self.create_physical_expressions(&keys, Context::Default, expr_arena)?;
                 if partitionable {
-                    let phys_aggs = self.create_physical_expressions(
-                        aggs.clone(),
-                        Context::Aggregation,
-                        expr_arena,
-                    )?;
+                    let phys_aggs =
+                        self.create_physical_expressions(&aggs, Context::Aggregation, expr_arena)?;
                     Ok(Box::new(PartitionGroupByExec::new(
                         input,
-                        phys_keys,
+                        phys_keys.pop().unwrap(),
                         phys_aggs,
                         aggs.into_iter()
                             .map(|n| node_to_exp(n, expr_arena))
@@ -316,7 +313,7 @@ impl DefaultPlanner {
                     )))
                 } else {
                     let phys_aggs =
-                        self.create_physical_expressions(aggs, Context::Aggregation, expr_arena)?;
+                        self.create_physical_expressions(&aggs, Context::Aggregation, expr_arena)?;
                     Ok(Box::new(GroupByExec::new(
                         input, phys_keys, phys_aggs, apply,
                     )))
@@ -357,9 +354,9 @@ impl DefaultPlanner {
                 let input_right =
                     self.create_initial_physical_plan(input_right, lp_arena, expr_arena)?;
                 let left_on =
-                    self.create_physical_expressions(left_on, Context::Default, expr_arena)?;
+                    self.create_physical_expressions(&left_on, Context::Default, expr_arena)?;
                 let right_on =
-                    self.create_physical_expressions(right_on, Context::Default, expr_arena)?;
+                    self.create_physical_expressions(&right_on, Context::Default, expr_arena)?;
                 Ok(Box::new(JoinExec::new(
                     input_left,
                     input_right,
@@ -372,7 +369,7 @@ impl DefaultPlanner {
             HStack { input, exprs, .. } => {
                 let input = self.create_initial_physical_plan(input, lp_arena, expr_arena)?;
                 let phys_expr =
-                    self.create_physical_expressions(exprs, Context::Default, expr_arena)?;
+                    self.create_physical_expressions(&exprs, Context::Default, expr_arena)?;
                 Ok(Box::new(StackExec::new(input, phys_expr)))
             }
             Udf {
@@ -399,8 +396,8 @@ impl DefaultPlanner {
                 order_by: _,
             } => {
                 // TODO! Order by
-                let group_column =
-                    self.create_physical_expr(partition_by, Context::Default, expr_arena)?;
+                let group_by =
+                    self.create_physical_expressions(&partition_by, Context::Default, expr_arena)?;
                 let mut out_name = None;
                 let mut apply_columns = aexpr_to_root_names(function, expr_arena);
                 if apply_columns.len() > 1 {
@@ -417,7 +414,7 @@ impl DefaultPlanner {
                 let function = node_to_exp(function, expr_arena);
 
                 Ok(Arc::new(WindowExpr {
-                    group_column,
+                    group_by,
                     apply_column,
                     out_name,
                     function,
@@ -512,15 +509,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Min)))
                             }
                             Context::Default => {
-                                let function = NoEq::new(Arc::new(move |s: Series| {
-                                    parallel_op(|s| Ok(s.min_as_series()), s, None)
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    parallel_op_series(|s| Ok(s.min_as_series()), s, None)
                                 })
                                     as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -532,15 +531,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Max)))
                             }
                             Context::Default => {
-                                let function = NoEq::new(Arc::new(move |s: Series| {
-                                    parallel_op(|s| Ok(s.max_as_series()), s, None)
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    parallel_op_series(|s| Ok(s.max_as_series()), s, None)
                                 })
                                     as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -552,15 +553,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Sum)))
                             }
                             Context::Default => {
-                                let function = NoEq::new(Arc::new(move |s: Series| {
-                                    parallel_op(|s| Ok(s.sum_as_series()), s, None)
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    parallel_op_series(|s| Ok(s.sum_as_series()), s, None)
                                 })
                                     as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -572,14 +575,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Std)))
                             }
                             Context::Default => {
-                                let function =
-                                    NoEq::new(Arc::new(move |s: Series| Ok(s.std_as_series()))
-                                        as Arc<dyn SeriesUdf>);
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    Ok(s.std_as_series())
+                                })
+                                    as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -591,14 +597,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Var)))
                             }
                             Context::Default => {
-                                let function =
-                                    NoEq::new(Arc::new(move |s: Series| Ok(s.var_as_series()))
-                                        as Arc<dyn SeriesUdf>);
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    Ok(s.var_as_series())
+                                })
+                                    as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -610,17 +619,19 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Mean)))
                             }
                             Context::Default => {
-                                let function = NoEq::new(Arc::new(move |s: Series| {
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
                                     let len = s.len() as f64;
-                                    parallel_op(|s| Ok(s.sum_as_series()), s, None)
+                                    parallel_op_series(|s| Ok(s.sum_as_series()), s, None)
                                         .map(|s| s.cast::<Float64Type>().unwrap() / len)
                                 })
                                     as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -632,14 +643,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Median)))
                             }
                             Context::Default => {
-                                let function =
-                                    NoEq::new(Arc::new(move |s: Series| Ok(s.median_as_series()))
-                                        as Arc<dyn SeriesUdf>);
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    Ok(s.median_as_series())
+                                })
+                                    as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -651,14 +665,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::First)))
                             }
                             Context::Default => {
-                                let function =
-                                    NoEq::new(Arc::new(move |s: Series| Ok(s.head(Some(1))))
-                                        as Arc<dyn SeriesUdf>);
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    Ok(s.head(Some(1)))
+                                })
+                                    as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -670,14 +687,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Last)))
                             }
                             Context::Default => {
-                                let function =
-                                    NoEq::new(Arc::new(move |s: Series| Ok(s.tail(Some(1))))
-                                        as Arc<dyn SeriesUdf>);
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
+                                    Ok(s.tail(Some(1)))
+                                })
+                                    as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -703,7 +723,8 @@ impl DefaultPlanner {
                                 GroupByMethod::NUnique,
                             ))),
                             Context::Default => {
-                                let function = NoEq::new(Arc::new(move |s: Series| {
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
                                     s.n_unique().map(|count| {
                                         UInt32Chunked::new_from_slice(s.name(), &[count as u32])
                                             .into_series()
@@ -711,10 +732,11 @@ impl DefaultPlanner {
                                 })
                                     as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: Some(DataType::UInt32),
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -727,15 +749,17 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggQuantileExpr::new(input, quantile)))
                             }
                             Context::Default => {
-                                let function = NoEq::new(Arc::new(move |s: Series| {
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
                                     s.quantile_as_series(quantile)
                                 })
                                     as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: None,
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -757,17 +781,19 @@ impl DefaultPlanner {
                                 Ok(Arc::new(AggregationExpr::new(input, GroupByMethod::Count)))
                             }
                             Context::Default => {
-                                let function = NoEq::new(Arc::new(move |s: Series| {
+                                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                                    let s = std::mem::take(&mut s[0]);
                                     let count = s.len();
                                     Ok(UInt32Chunked::new_from_slice(s.name(), &[count as u32])
                                         .into_series())
                                 })
                                     as Arc<dyn SeriesUdf>);
                                 Ok(Arc::new(ApplyExpr {
-                                    input,
+                                    inputs: vec![input],
                                     function,
                                     output_type: Some(DataType::UInt32),
                                     expr: node_to_exp(expression, expr_arena),
+                                    collect_groups: false,
                                 }))
                             }
                         }
@@ -793,17 +819,19 @@ impl DefaultPlanner {
                     expr: node_to_exp(expression, expr_arena),
                 }))
             }
-            Udf {
+            Function {
                 input,
                 function,
                 output_type,
+                collect_groups,
             } => {
-                let input = self.create_physical_expr(input, ctxt, expr_arena)?;
+                let input = self.create_physical_expressions(&input, ctxt, expr_arena)?;
                 Ok(Arc::new(ApplyExpr {
-                    input,
+                    inputs: input,
                     function,
                     output_type,
                     expr: node_to_exp(expression, expr_arena),
+                    collect_groups,
                 }))
             }
             BinaryFunction {
@@ -823,15 +851,17 @@ impl DefaultPlanner {
             }
             Shift { input, periods } => {
                 let input = self.create_physical_expr(input, ctxt, expr_arena)?;
-                let function = NoEq::new(
-                    Arc::new(move |s: Series| Ok(s.shift(periods))) as Arc<dyn SeriesUdf>
-                );
-                Ok(Arc::new(ApplyExpr::new(
-                    input,
+                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                    let s = std::mem::take(&mut s[0]);
+                    Ok(s.shift(periods))
+                }) as Arc<dyn SeriesUdf>);
+                Ok(Arc::new(ApplyExpr {
+                    inputs: vec![input],
                     function,
-                    None,
-                    node_to_exp(expression, expr_arena),
-                )))
+                    output_type: None,
+                    expr: node_to_exp(expression, expr_arena),
+                    collect_groups: false,
+                }))
             }
             Slice {
                 input,
@@ -847,51 +877,59 @@ impl DefaultPlanner {
             }
             Reverse(expr) => {
                 let input = self.create_physical_expr(expr, ctxt, expr_arena)?;
-                let function =
-                    NoEq::new(Arc::new(move |s: Series| Ok(s.reverse())) as Arc<dyn SeriesUdf>);
-                Ok(Arc::new(ApplyExpr::new(
-                    input,
+                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                    let s = std::mem::take(&mut s[0]);
+                    Ok(s.reverse())
+                }) as Arc<dyn SeriesUdf>);
+                Ok(Arc::new(ApplyExpr {
+                    inputs: vec![input],
                     function,
-                    None,
-                    node_to_exp(expression, expr_arena),
-                )))
+                    output_type: None,
+                    expr: node_to_exp(expression, expr_arena),
+                    collect_groups: false,
+                }))
             }
             Duplicated(expr) => {
                 let input = self.create_physical_expr(expr, ctxt, expr_arena)?;
-                let function = NoEq::new(Arc::new(move |s: Series| {
+                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                    let s = std::mem::take(&mut s[0]);
                     s.is_duplicated().map(|ca| ca.into_series())
                 }) as Arc<dyn SeriesUdf>);
-                Ok(Arc::new(ApplyExpr::new(
-                    input,
+                Ok(Arc::new(ApplyExpr {
+                    inputs: vec![input],
                     function,
-                    None,
-                    node_to_exp(expression, expr_arena),
-                )))
+                    output_type: None,
+                    expr: node_to_exp(expression, expr_arena),
+                    collect_groups: false,
+                }))
             }
             IsUnique(expr) => {
                 let input = self.create_physical_expr(expr, ctxt, expr_arena)?;
-                let function =
-                    NoEq::new(
-                        Arc::new(move |s: Series| s.is_unique().map(|ca| ca.into_series()))
-                            as Arc<dyn SeriesUdf>,
-                    );
-                Ok(Arc::new(ApplyExpr::new(
-                    input,
+                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                    let s = std::mem::take(&mut s[0]);
+                    s.is_unique().map(|ca| ca.into_series())
+                }) as Arc<dyn SeriesUdf>);
+                Ok(Arc::new(ApplyExpr {
+                    inputs: vec![input],
                     function,
-                    None,
-                    node_to_exp(expression, expr_arena),
-                )))
+                    output_type: None,
+                    expr: node_to_exp(expression, expr_arena),
+                    collect_groups: false,
+                }))
             }
             Explode(expr) => {
                 let input = self.create_physical_expr(expr, ctxt, expr_arena)?;
-                let function =
-                    NoEq::new(Arc::new(move |s: Series| s.explode()) as Arc<dyn SeriesUdf>);
-                Ok(Arc::new(ApplyExpr::new(
-                    input,
+                let function = NoEq::new(Arc::new(move |s: &mut [Series]| {
+                    let s = std::mem::take(&mut s[0]);
+                    s.explode()
+                }) as Arc<dyn SeriesUdf>);
+                Ok(Arc::new(ApplyExpr {
+                    inputs: vec![input],
                     function,
-                    None,
-                    node_to_exp(expression, expr_arena),
-                )))
+                    output_type: None,
+                    expr: node_to_exp(expression, expr_arena),
+                    collect_groups: false,
+                }))
             }
             Wildcard => panic!("should be no wildcard at this point"),
             Except(_) => panic!("should be no except at this point"),

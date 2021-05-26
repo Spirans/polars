@@ -50,7 +50,7 @@ impl DataFrame {
     /// use polars_core::frame::groupby::resample::SampleRule;
     ///
     /// fn example(df: &DataFrame) -> Result<DataFrame> {
-    ///     df.downsample("datetime", SampleRule::Minute(6))?
+    ///     df.downsample("datetime", SampleRule::Minute(5))?
     ///         .first()?
     ///         .sort("datetime", false)
     /// }
@@ -71,7 +71,7 @@ impl DataFrame {
     ///  │ 2000-01-01 00:15:00 ┆ 15      │
     ///  ╰─────────────────────┴─────────╯
     /// ```
-    #[cfg_attr(docsrs, doc(cfg(feature = "downsample", feature = "temporal")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "downsample", feature = "temporal"))))]
     #[cfg(all(feature = "downsample", feature = "temporal"))]
     pub fn downsample(&self, key: &str, rule: SampleRule) -> Result<GroupBy> {
         let s = self.column(key)?;
@@ -79,7 +79,7 @@ impl DataFrame {
     }
 
     /// See [downsample](crate::frame::DataFrame::downsample).
-    #[cfg_attr(docsrs, doc(cfg(feature = "downsample", feature = "temporal")))]
+    #[cfg_attr(docsrs, doc(cfg(all(feature = "downsample", feature = "temporal"))))]
     #[cfg(all(feature = "downsample", feature = "temporal"))]
     pub fn downsample_with_series(&self, key: &Series, rule: SampleRule) -> Result<GroupBy> {
         use SampleRule::*;

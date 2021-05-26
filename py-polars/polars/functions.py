@@ -76,6 +76,14 @@ def _prepare_file_arg(
 
 
 def get_dummies(df: DataFrame) -> DataFrame:
+    """
+    Convert categorical variable into dummy/indicator variables.
+
+    Parameters
+    ----------
+    df
+        DataFrame to convert
+    """
     return df.to_dummies()
 
 
@@ -194,6 +202,7 @@ def scan_csv(
     stop_after_n_rows: "Optional[int]" = None,
     cache: bool = True,
     dtype: "Optional[Dict[str, DataType]]" = None,
+    low_memory: bool = False,
 ) -> "LazyFrame":
     """
     Lazily read from a csv file.
@@ -221,6 +230,8 @@ def scan_csv(
         Cache the result after reading
     dtype
         Overwrite the dtypes during inference
+    low_memory
+        Reduce memory usage in expense of performance
     """
     if isinstance(file, Path):
         file = str(file)
@@ -233,6 +244,7 @@ def scan_csv(
         stop_after_n_rows=stop_after_n_rows,
         cache=cache,
         dtype=dtype,
+        low_memory=low_memory,
     )
 
 
@@ -397,7 +409,7 @@ def from_pandas(
     data = {}
 
     for (name, dtype) in zip(df.columns, df.dtypes):
-        if dtype == "object" and isinstance(df[name][0], str):
+        if dtype == "object" and isinstance(df[name].iloc[0], str):
             data[name] = pa.array(df[name], pa.large_utf8())
         elif dtype == "datetime64[ns]":
             # We first cast to ms because that's the unit of Date64

@@ -1,6 +1,10 @@
 use crate::prelude::*;
 use polars_core::prelude::*;
 
+fn to_aexprs(input: Vec<Expr>, arena: &mut Arena<AExpr>) -> Vec<Node> {
+    input.into_iter().map(|e| to_aexpr(e, arena)).collect()
+}
+
 // converts expression to AExpr, which uses an arena (Vec) for allocation
 pub(crate) fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
     let v = match expr {
@@ -81,14 +85,16 @@ pub(crate) fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
                 falsy: f,
             }
         }
-        Expr::Udf {
+        Expr::Function {
             input,
             function,
             output_type,
-        } => AExpr::Udf {
-            input: to_aexpr(*input, arena),
+            collect_groups,
+        } => AExpr::Function {
+            input: to_aexprs(input, arena),
             function,
             output_type,
+            collect_groups,
         },
         Expr::BinaryFunction {
             input_a,
@@ -111,7 +117,7 @@ pub(crate) fn to_aexpr(expr: Expr, arena: &mut Arena<AExpr>) -> Node {
             order_by,
         } => AExpr::Window {
             function: to_aexpr(*function, arena),
-            partition_by: to_aexpr(*partition_by, arena),
+            partition_by: to_aexprs(partition_by, arena),
             order_by: order_by.map(|ob| to_aexpr(*ob, arena)),
         },
         Expr::Slice {
@@ -533,18 +539,17 @@ pub(crate) fn node_to_exp(node: Node, expr_arena: &Arena<AExpr>) -> Expr {
                 falsy: Box::new(f),
             }
         }
-        AExpr::Udf {
+        AExpr::Function {
             input,
             function,
             output_type,
-        } => {
-            let i = node_to_exp(input, expr_arena);
-            Expr::Udf {
-                input: Box::new(i),
-                function,
-                output_type,
-            }
-        }
+            collect_groups,
+        } => Expr::Function {
+            input: nodes_to_exprs(&input, expr_arena),
+            function,
+            output_type,
+            collect_groups,
+        },
         AExpr::BinaryFunction {
             input_a,
             input_b,
@@ -562,7 +567,7 @@ pub(crate) fn node_to_exp(node: Node, expr_arena: &Arena<AExpr>) -> Expr {
             order_by,
         } => {
             let function = Box::new(node_to_exp(function, expr_arena));
-            let partition_by = Box::new(node_to_exp(partition_by, expr_arena));
+            let partition_by = nodes_to_exprs(&partition_by, expr_arena);
             let order_by = order_by.map(|ob| Box::new(node_to_exp(ob, expr_arena)));
             Expr::Window {
                 function,

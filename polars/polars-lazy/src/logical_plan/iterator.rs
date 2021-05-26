@@ -64,7 +64,7 @@ impl<'a> Iterator for ExprIter<'a> {
                     push(falsy);
                     push(predicate)
                 }
-                Udf { input, .. } => push(input),
+                Function { input, .. } => input.iter().for_each(|e| push(e)),
                 Shift { input, .. } => push(input),
                 Reverse(e) => push(e),
                 Duplicated(e) => push(e),
@@ -76,7 +76,9 @@ impl<'a> Iterator for ExprIter<'a> {
                     order_by,
                 } => {
                     push(function);
-                    push(partition_by);
+                    for e in partition_by {
+                        push(e)
+                    }
                     if let Some(e) = order_by {
                         push(e);
                     }
@@ -164,7 +166,7 @@ impl AExpr {
                 push(falsy);
                 push(predicate)
             }
-            Udf { input, .. } => push(input),
+            Function { input, .. } => input.iter().for_each(|e| push(e)),
             Shift { input, .. } => push(input),
             Reverse(e) => push(e),
             Duplicated(e) => push(e),
@@ -176,7 +178,9 @@ impl AExpr {
                 order_by,
             } => {
                 push(function);
-                push(partition_by);
+                for e in partition_by {
+                    push(e);
+                }
                 if let Some(e) = order_by {
                     push(e);
                 }

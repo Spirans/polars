@@ -162,9 +162,9 @@ class Series:
             elif dtype == UInt64:
                 self._s = PySeries.new_u64(name, values)
             elif dtype == Float32:
-                self._s = PySeries.new_f32(name, values)
+                self._s = PySeries.new_f32(name, values, nullable)
             elif dtype == Float64:
-                self._s = PySeries.new_f64(name, values)
+                self._s = PySeries.new_f64(name, values, nullable)
             elif dtype == Boolean:
                 self._s = PySeries.new_bool(name, values)
             elif dtype == Utf8:
@@ -658,6 +658,9 @@ class Series:
         self._s.rename(name)
 
     def chunk_lengths(self) -> "List[int]":
+        """
+        Get the length of each individual chunk
+        """
         return self._s.chunk_lengths()
 
     def n_chunks(self) -> int:
@@ -734,16 +737,18 @@ class Series:
         """
         self._s.append(other._s)
 
-    def filter(self, filter: "Series") -> "Series":
+    def filter(self, predicate: "Series") -> "Series":
         """
         Filter elements by a boolean mask
 
         Parameters
         ----------
-        filter
+        predicate
             Boolean mask
         """
-        return Series._from_pyseries(self._s.filter(filter._s))
+        if isinstance(predicate, list):
+            predicate = Series("", predicate)
+        return Series._from_pyseries(self._s.filter(predicate._s))
 
     def head(self, length: Optional[int] = None) -> "Series":
         """
@@ -800,7 +805,7 @@ class Series:
         indexes
             Indexes that can be used to sort this array.
         """
-        return self._s.argsort(reverse)
+        return wrap_s(self._s.argsort(reverse))
 
     def arg_sort(self, reverse: bool = False) -> "Series":
         """
@@ -811,7 +816,7 @@ class Series:
         indexes
             Indexes that can be used to sort this array.
         """
-        return self._s.argsort(reverse)
+        return wrap_s(self._s.argsort(reverse))
 
     def arg_unique(self) -> "Series":
         """
@@ -1095,6 +1100,9 @@ class Series:
         return array
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        """
+        Numpy universal functions
+        """
         if self._s.n_chunks() > 0:
             self._s.rechunk(in_place=True)
 
@@ -1204,7 +1212,7 @@ class Series:
 
     def fill_none(self, strategy: str) -> "Series":
         """
-        Fill null values with a fill strategy.
+        Fill null values with a filling strategy.
 
         Parameters
         ----------
@@ -1214,40 +1222,42 @@ class Series:
                * "min"
                * "max"
                * "mean"
+               * "one"
+               * "zero"
         """
         return wrap_s(self._s.fill_none(strategy))
 
     def apply(
         self,
         func: "Union[Callable[['Any'], 'Any'], Callable[['Any'], 'Any']]",
-        dtype_out: "Optional['DataType']" = None,
+        return_dtype: "Optional['DataType']" = None,
     ):
         """
         Apply a function over elements in this Series and return a new Series.
 
-        If the function returns another datatype, the dtype_out arg should be set, otherwise the method will fail.
+        If the function returns another datatype, the return_dtype arg should be set, otherwise the method will fail.
 
         Parameters
         ----------
         func
             function or lambda.
-        dtype_out
+        return_dtype
             Output datatype. If none given the same datatype as this Series will be used.
 
         Returns
         -------
         Series
         """
-        if dtype_out == str:
-            dtype_out = Utf8
-        elif dtype_out == int:
-            dtype_out = Int64
-        elif dtype_out == float:
-            dtype_out = Float64
-        elif dtype_out == bool:
-            dtype_out = Boolean
+        if return_dtype == str:
+            return_dtype = Utf8
+        elif return_dtype == int:
+            return_dtype = Int64
+        elif return_dtype == float:
+            return_dtype = Float64
+        elif return_dtype == bool:
+            return_dtype = Boolean
 
-        return wrap_s(self._s.apply_lambda(func, dtype_out))
+        return wrap_s(self._s.apply_lambda(func, return_dtype))
 
     def shift(self, periods: int) -> "Series":
         """
@@ -1727,6 +1737,10 @@ class Series:
 
 
 class SeriesIter:
+    """
+    Utility class that allows slow iteration over a `Series`
+    """
+
     def __init__(self, length: int, s: "Series"):
         self.len = length
         self.i = 0

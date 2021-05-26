@@ -6,12 +6,11 @@ use crate::series::private::PrivateSeries;
 use arrow::array::{ArrayData, ArrayRef};
 use arrow::buffer::Buffer;
 use std::any::Any;
-use std::fmt::Debug;
 
 #[cfg(feature = "object")]
 impl<T> IntoSeries for ObjectChunked<T>
 where
-    T: 'static + std::fmt::Debug + Clone + Send + Sync + Default,
+    T: PolarsObject,
 {
     fn into_series(self) -> Series {
         Series(Arc::new(SeriesWrap(self)))
@@ -20,15 +19,12 @@ where
 
 #[cfg(feature = "object")]
 #[cfg_attr(docsrs, doc(cfg(feature = "object")))]
-impl<T> PrivateSeries for SeriesWrap<ObjectChunked<T>> where
-    T: 'static + Debug + Clone + Send + Sync + Default
-{
-}
+impl<T> PrivateSeries for SeriesWrap<ObjectChunked<T>> where T: PolarsObject {}
 #[cfg(feature = "object")]
 #[cfg_attr(docsrs, doc(cfg(feature = "object")))]
 impl<T> SeriesTrait for SeriesWrap<ObjectChunked<T>>
 where
-    T: 'static + Debug + Clone + Send + Sync + Default,
+    T: PolarsObject,
 {
     fn rename(&mut self, name: &str) {
         ObjectChunked::rename(&mut self.0, name)
@@ -81,23 +77,29 @@ where
         ChunkFilter::filter(&self.0, filter).map(|ca| ca.into_series())
     }
 
-    fn take_iter(&self, _iter: &mut dyn Iterator<Item = usize>) -> Series {
-        todo!()
+    fn take_iter(&self, iter: &mut dyn Iterator<Item = usize>) -> Series {
+        ChunkTake::take(&self.0, iter.into()).into_series()
     }
 
-    unsafe fn take_iter_unchecked(&self, _iter: &mut dyn Iterator<Item = usize>) -> Series {
-        todo!()
+    unsafe fn take_iter_unchecked(&self, iter: &mut dyn Iterator<Item = usize>) -> Series {
+        ChunkTake::take_unchecked(&self.0, iter.into()).into_series()
     }
 
-    unsafe fn take_unchecked(&self, _idx: &UInt32Chunked) -> Result<Series> {
-        todo!()
+    unsafe fn take_unchecked(&self, idx: &UInt32Chunked) -> Result<Series> {
+        use std::borrow::Cow;
+        let idx = if idx.chunks.len() > 1 {
+            Cow::Owned(idx.rechunk())
+        } else {
+            Cow::Borrowed(idx)
+        };
+        Ok(ChunkTake::take_unchecked(&self.0, (&*idx).into()).into_series())
     }
 
     unsafe fn take_opt_iter_unchecked(
         &self,
-        _iter: &mut dyn Iterator<Item = Option<usize>>,
+        iter: &mut dyn Iterator<Item = Option<usize>>,
     ) -> Series {
-        todo!()
+        ChunkTake::take_unchecked(&self.0, SeriesWrap(iter).into()).into_series()
     }
 
     fn take_opt_iter(&self, _iter: &mut dyn Iterator<Item = Option<usize>>) -> Series {

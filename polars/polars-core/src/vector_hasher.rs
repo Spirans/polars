@@ -21,68 +21,6 @@ pub trait VecHash {
     }
 }
 
-pub trait VecHashId {
-    /// Compute the hash id by interpreting the bits as 64 bits.
-    ///
-    /// Watch out for [accidental quadratic behavior](https://accidentallyquadratic.tumblr.com/post/153545455987/rust-hash-iteration-reinsertion)
-    fn vec_hash_id(&self) -> UInt64Chunked {
-        unimplemented!()
-    }
-}
-
-/// A random u64 used for the None case
-/// the other values hash `T` instead of `Option<T>`
-const RANDOM_U64: u64 = 4352984574;
-
-impl VecHashId for UInt64Chunked {
-    fn vec_hash_id(&self) -> UInt64Chunked {
-        self.branch_apply_cast_numeric_no_null(|opt_v| match opt_v {
-            None => RANDOM_U64,
-            Some(v) => v,
-        })
-    }
-}
-
-impl VecHashId for UInt32Chunked {
-    fn vec_hash_id(&self) -> UInt64Chunked {
-        self.branch_apply_cast_numeric_no_null(|opt_v| match opt_v {
-            None => RANDOM_U64,
-            Some(v) => v as u64,
-        })
-    }
-}
-
-impl VecHashId for Int32Chunked {
-    fn vec_hash_id(&self) -> UInt64Chunked {
-        self.branch_apply_cast_numeric_no_null(|opt_v| match opt_v {
-            None => RANDOM_U64,
-            Some(v) => (unsafe { std::mem::transmute::<i32, u32>(v) }) as u64,
-        })
-    }
-}
-
-impl VecHashId for Int64Chunked {
-    fn vec_hash_id(&self) -> UInt64Chunked {
-        self.branch_apply_cast_numeric_no_null(|opt_v| match opt_v {
-            None => RANDOM_U64,
-            Some(v) => unsafe { std::mem::transmute::<i64, u64>(v) },
-        })
-    }
-}
-
-impl Series {
-    pub fn vec_hash_id(&self) -> UInt64Chunked {
-        use DataType::*;
-        match self.dtype() {
-            UInt64 => self.u64().unwrap().vec_hash_id(),
-            Int64 => self.i64().unwrap().vec_hash_id(),
-            Int32 => self.i32().unwrap().vec_hash_id(),
-            UInt32 => self.u32().unwrap().vec_hash_id(),
-            _ => unimplemented!(),
-        }
-    }
-}
-
 impl<T> VecHash for ChunkedArray<T>
 where
     T: PolarsIntegerType,
@@ -216,52 +154,63 @@ pub(crate) fn this_thread(h: u64, thread_no: u64, n_threads: u64) -> bool {
 }
 
 fn finish_table_from_key_hashes<T>(
-    hashes_nd_keys: Vec<(u64, T)>,
+    hashes: Vec<u64>,
+    keys: impl Iterator<Item = T>,
     mut hash_tbl: HashMap<T, Vec<u32>, RandomState>,
     offset: usize,
 ) -> HashMap<T, Vec<u32>, RandomState>
 where
     T: Hash + Eq,
 {
-    hashes_nd_keys
+    hashes
         .into_iter()
+        .zip(keys)
         .enumerate()
         .for_each(|(idx, (h, t))| {
             let idx = (idx + offset) as u32;
-            hash_tbl
+
+            let entry = hash_tbl
                 .raw_entry_mut()
                 // uses the key to check equality to find and entry
-                .from_key_hashed_nocheck(h, &t)
-                // if entry is found modify it
-                .and_modify(|_k, v| {
+                .from_key_hashed_nocheck(h, &t);
+
+            match entry {
+                RawEntryMut::Vacant(entry) => {
+                    entry.insert_hashed_nocheck(h, t, vec![idx]);
+                }
+                RawEntryMut::Occupied(mut entry) => {
+                    let (_k, v) = entry.get_key_value_mut();
                     v.push(idx);
-                })
-                // otherwise we insert both the key and new Vec without hashing
-                .or_insert_with(|| (t, vec![idx]));
+                }
+            }
         });
     hash_tbl
 }
 
 pub(crate) fn prepare_hashed_relation<T>(
+    a: impl Iterator<Item = T>,
     b: impl Iterator<Item = T>,
+    preallocate: bool,
 ) -> HashMap<T, Vec<u32>, RandomState>
 where
     T: Hash + Eq,
 {
     let build_hasher = RandomState::default();
 
-    let hashes_nd_keys = b
+    let hashes = a
         .map(|val| {
             let mut hasher = build_hasher.build_hasher();
             val.hash(&mut hasher);
-            (hasher.finish(), val)
+            hasher.finish()
         })
         .collect::<Vec<_>>();
 
-    let hash_tbl: HashMap<T, Vec<u32>, RandomState> =
-        HashMap::with_capacity_and_hasher(hashes_nd_keys.len(), build_hasher);
+    let size = if preallocate { hashes.len() } else { 4096 };
 
-    finish_table_from_key_hashes(hashes_nd_keys, hash_tbl, 0)
+    let hash_tbl: HashMap<T, Vec<u32>, RandomState> =
+        HashMap::with_capacity_and_hasher(size, build_hasher);
+
+    finish_table_from_key_hashes(hashes, b, hash_tbl, 0)
 }
 
 pub(crate) fn prepare_hashed_relation_threaded<T, I>(
@@ -273,7 +222,6 @@ where
 {
     let n_threads = iters.len();
     let (hashes_and_keys, build_hasher) = create_hash_and_keys_threaded_vectorized(iters, None);
-    let size = hashes_and_keys.iter().fold(0, |acc, v| acc + v.len());
 
     // We will create a hashtable in every thread.
     // We use the hash to partition the keys to the matching hashtable.
@@ -284,7 +232,7 @@ where
             let hashes_and_keys = &hashes_and_keys;
             let thread_no = thread_no as u64;
             let mut hash_tbl: HashMap<T, Vec<u32>, RandomState> =
-                HashMap::with_capacity_and_hasher(size / (5 * n_threads), build_hasher);
+                HashMap::with_hasher(build_hasher);
 
             let n_threads = n_threads as u64;
             let mut offset = 0;
@@ -351,11 +299,9 @@ where
     (hashes, build_hasher)
 }
 
-// Combines two hashes into one hash
-// http://myeyesareblind.com/2017/02/06/Combine-hash-values/
-fn combine_hashes(l: u64, r: u64) -> u64 {
-    let hash = (17 * 37u64).wrapping_add(l);
-    hash.wrapping_mul(37).wrapping_add(r)
+// hash combine from c++' boost lib
+fn boost_hash_combine(l: u64, r: u64) -> u64 {
+    l ^ r.wrapping_add(0x9e3779b9u64.wrapping_add(l << 6).wrapping_add(r >> 2))
 }
 
 pub(crate) fn df_rows_to_hashes_threaded(
@@ -392,27 +338,69 @@ pub(crate) fn df_rows_to_hashes(
         })
         .collect();
 
-    let mut iter = hashes.into_iter();
-    let first = iter.next().unwrap();
+    let n_chunks = hashes[0].chunks().len();
+    let mut av = AlignedVec::with_capacity_aligned(keys.height());
 
-    // take the columns of hashes and create one hash from them.
-    // All columns have the same no. of chunks so we can take the fast path.
-    (
-        iter.fold(first, |acc, s| {
-            let chunks = acc
-                .data_views()
-                .zip(s.data_views())
-                .map(|(array_left, array_right)| {
-                    let av: AlignedVec<_> = array_left
-                        .iter()
-                        .zip(array_right)
-                        .map(|(&l, &r)| combine_hashes(l, r))
-                        .collect();
-                    Arc::new(av.into_primitive_array::<UInt64Type>(None)) as ArrayRef
-                })
-                .collect();
-            UInt64Chunked::new_from_chunks("", chunks)
-        }),
-        build_hasher,
-    )
+    // two code paths, one has one layer of indirection less.
+    if n_chunks == 1 {
+        let chunks: Vec<&[u64]> = hashes
+            .iter()
+            .map(|ca| {
+                ca.downcast_iter()
+                    .map(|arr| arr.values())
+                    .collect::<Vec<_>>()[0]
+            })
+            .collect();
+        unsafe {
+            let chunk_len = chunks.get_unchecked(0).len();
+
+            // over chunk length in column direction
+            for idx in 0..chunk_len {
+                let hslice = chunks.get_unchecked(0);
+                let mut h = *hslice.get_unchecked(idx);
+
+                // in row direction
+                for column_i in 1..hashes.len() {
+                    let hslice = chunks.get_unchecked(column_i);
+                    let h_ = *hslice.get_unchecked(idx);
+                    h = boost_hash_combine(h, h_)
+                }
+
+                av.push(h);
+            }
+        }
+    // path with more indirection
+    } else {
+        let chunks: Vec<Vec<&[u64]>> = hashes
+            .iter()
+            .map(|ca| {
+                ca.downcast_iter()
+                    .map(|arr| arr.values())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        unsafe {
+            for chunk_i in 0..n_chunks {
+                let chunk_len = chunks.get_unchecked(0).get_unchecked(chunk_i).len();
+
+                // over chunk length in column direction
+                for idx in 0..chunk_len {
+                    let hslice = chunks.get_unchecked(0).get_unchecked(chunk_i);
+                    let mut h = *hslice.get_unchecked(idx);
+
+                    // in row direction
+                    for column_i in 1..hashes.len() {
+                        let hslice = chunks.get_unchecked(column_i).get_unchecked(chunk_i);
+                        let h_ = *hslice.get_unchecked(idx);
+                        h = boost_hash_combine(h, h_)
+                    }
+
+                    av.push(h);
+                }
+            }
+        }
+    }
+
+    let chunks = vec![Arc::new(av.into_primitive_array::<UInt64Type>(None)) as ArrayRef];
+    (UInt64Chunked::new_from_chunks("", chunks), build_hasher)
 }

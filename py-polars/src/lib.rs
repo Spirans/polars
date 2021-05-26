@@ -27,10 +27,10 @@ pub mod prelude;
 pub mod series;
 pub mod utils;
 
-use mimalloc::MiMalloc;
-use std::iter::FromIterator;
 use crate::utils::str_to_polarstype;
+use mimalloc::MiMalloc;
 use polars::prelude::*;
+use std::iter::FromIterator;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -81,6 +81,12 @@ fn cov(a: dsl::PyExpr, b: dsl::PyExpr) -> dsl::PyExpr {
 }
 
 #[pyfunction]
+fn argsort_by(by: Vec<dsl::PyExpr>, reverse: Vec<bool>) -> dsl::PyExpr {
+    let by = by.into_iter().map(|e| e.inner).collect();
+    polars::lazy::functions::argsort_by(by, &reverse).into()
+}
+
+#[pyfunction]
 fn when(predicate: PyExpr) -> dsl::When {
     dsl::when(predicate)
 }
@@ -96,7 +102,6 @@ fn toggle_string_cache(toggle: bool) {
     polars::toggle_string_cache(toggle)
 }
 
-
 #[pyfunction]
 fn series_from_range(low: i64, high: i64, dtype: &PyAny) -> PySeries {
     let str_repr = dtype.str().unwrap().to_str().unwrap();
@@ -106,7 +111,7 @@ fn series_from_range(low: i64, high: i64, dtype: &PyAny) -> PySeries {
         DataType::UInt32 => Series::from_iter((low as u32)..(high as u32)).into(),
         DataType::Int32 => Series::from_iter((low as i32)..(high as i32)).into(),
         DataType::Int64 => Series::from_iter((low as i64)..(high as i64)).into(),
-        _ => unimplemented!()
+        _ => unimplemented!(),
     }
 }
 
@@ -123,6 +128,7 @@ fn polars(_py: Python, m: &PyModule) -> PyResult<()> {
     m.add_wrapped(wrap_pyfunction!(binary_function)).unwrap();
     m.add_wrapped(wrap_pyfunction!(pearson_corr)).unwrap();
     m.add_wrapped(wrap_pyfunction!(cov)).unwrap();
+    m.add_wrapped(wrap_pyfunction!(argsort_by)).unwrap();
     m.add_wrapped(wrap_pyfunction!(when)).unwrap();
     m.add_wrapped(wrap_pyfunction!(version)).unwrap();
     m.add_wrapped(wrap_pyfunction!(toggle_string_cache))

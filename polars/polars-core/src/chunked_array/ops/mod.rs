@@ -9,6 +9,7 @@ use arrow::array::{ArrayRef, UInt32Array};
 use std::marker::Sized;
 
 pub(crate) mod aggregate;
+pub(crate) mod any_value;
 pub(crate) mod apply;
 pub(crate) mod chunkops;
 pub(crate) mod cum_agg;
@@ -24,10 +25,23 @@ pub(crate) mod set;
 pub(crate) mod shift;
 pub(crate) mod sort;
 pub(crate) mod take;
+pub(crate) mod take_random;
 pub(crate) mod take_single;
 pub(crate) mod unique;
 pub(crate) mod window;
 pub(crate) mod zip;
+
+pub trait ChunkAnyValue {
+    /// Get a single value. Beware this is slow.
+    /// If you need to use this slightly performant, cast Categorical to UInt32
+    ///
+    /// # Safety
+    /// Does not do any bounds checking.
+    unsafe fn get_any_value_unchecked(&self, index: usize) -> AnyValue;
+
+    /// Get a single value. Beware this is slow.
+    fn get_any_value(&self, index: usize) -> AnyValue;
+}
 
 pub trait ChunkCumAgg<T> {
     /// Get an array with the cumulative max computed at every element
@@ -735,6 +749,15 @@ impl ChunkFullNull for ListChunked {
     }
 }
 
+#[cfg(feature = "object")]
+impl<T: PolarsObject> ChunkFullNull for ObjectChunked<T> {
+    fn full_null(name: &str, length: usize) -> ObjectChunked<T> {
+        let mut ca: Self = (0..length).map(|_| None).collect();
+        ca.rename(name);
+        ca
+    }
+}
+
 /// Reverse a ChunkedArray<T>
 pub trait ChunkReverse<T> {
     /// Return a reversed version of this array.
@@ -778,7 +801,7 @@ impl_reverse!(BooleanType, BooleanChunked);
 impl_reverse!(Utf8Type, Utf8Chunked);
 impl_reverse!(ListType, ListChunked);
 #[cfg(feature = "object")]
-impl<T> ChunkReverse<ObjectType<T>> for ObjectChunked<T> {
+impl<T: PolarsObject> ChunkReverse<ObjectType<T>> for ObjectChunked<T> {
     fn reverse(&self) -> Self {
         // Safety
         // we we know we don't get out of bounds

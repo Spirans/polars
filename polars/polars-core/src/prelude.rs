@@ -13,7 +13,8 @@ pub use crate::{
         ops::{
             aggregate::*,
             chunkops::ChunkOps,
-            take::{AsTakeIndex, IntoTakeRandom, NumTakeRandomChunked, NumTakeRandomCont},
+            take::AsTakeIndex,
+            take_random::{IntoTakeRandom, NumTakeRandomChunked, NumTakeRandomCont},
             window::InitFold,
             *,
         },
@@ -38,3 +39,6 @@ pub use std::sync::Arc;
 
 #[cfg(feature = "temporal")]
 pub use crate::chunked_array::temporal::conversion::*;
+
+#[cfg(feature = "object")]
+pub use crate::chunked_array::object::PolarsObject;

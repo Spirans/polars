@@ -21,6 +21,9 @@ use std::hash::Hash;
 use std::ops::Deref;
 use unsafe_unwrap::UnsafeUnwrap;
 
+#[cfg(feature = "private")]
+pub use self::multiple_keys::private_left_join_multiple_keys;
+
 /// If Categorical types are created without a global string cache or under
 /// a different global string cache the mapping will be incorrect.
 pub(crate) fn check_categorical_src(l: &Series, r: &Series) -> Result<()> {
@@ -1320,6 +1323,7 @@ mod test {
 
     #[test]
     fn test_join_categorical() {
+        let _lock = crate::SINGLE_LOCK.lock();
         toggle_string_cache(true);
 
         let (mut df_a, mut df_b) = get_dfs();

@@ -2,13 +2,14 @@ use crate::logical_plan::Context;
 use crate::physical_plan::state::ExecutionState;
 use crate::prelude::*;
 use polars_core::frame::groupby::GroupBy;
+use polars_core::frame::hash_join::private_left_join_multiple_keys;
 use polars_core::prelude::*;
 use std::sync::Arc;
 
 pub struct WindowExpr {
     /// the root column that the Function will be applied on.
     /// This will be used to create a smaller DataFrame to prevent taking unneeded columns by index
-    pub(crate) group_column: Arc<dyn PhysicalExpr>,
+    pub(crate) group_by: Vec<Arc<dyn PhysicalExpr>>,
     pub(crate) apply_column: Arc<String>,
     pub(crate) out_name: Option<Arc<String>>,
     /// A function Expr. i.e. Mean, Median, Max, etc.
@@ -33,8 +34,14 @@ impl PhysicalExpr for WindowExpr {
             .iter()
             .for_each(|s| key.push_str(&format!("{}", s.get_data_ptr())));
 
-        let groupby_column = self.group_column.evaluate(df, state)?;
-        key.push_str(groupby_column.name());
+        let groupby_columns = self
+            .group_by
+            .iter()
+            .map(|e| e.evaluate(df, state))
+            .collect::<Result<Vec<_>>>()?;
+        groupby_columns.iter().for_each(|e| {
+            key.push_str(e.name());
+        });
 
         // 1. get the group tuples
         // We keep the lock for the entire window expression, we want those to be sequential
@@ -53,14 +60,16 @@ impl PhysicalExpr for WindowExpr {
                     break;
                 }
                 Err(_) => {
-                    std::thread::yield_now();
+                    // thread yield could still cause a dead lock, maybe because it remained
+                    // high priority?
+                    std::thread::sleep(std::time::Duration::from_millis(1));
                 }
             }
         }
         let groups = match groups_lock.get_mut(&key) {
             Some(groups) => std::mem::take(groups),
             None => {
-                let mut gb = df.groupby_with_series(vec![groupby_column.clone()], true)?;
+                let mut gb = df.groupby_with_series(groupby_columns.clone(), true)?;
                 std::mem::take(gb.get_groups_mut())
             }
         };
@@ -68,15 +77,15 @@ impl PhysicalExpr for WindowExpr {
         // 2. create GroupBy object and apply aggregation
         let mut gb = GroupBy::new(
             df,
-            vec![groupby_column.clone()],
+            groupby_columns.clone(),
             groups,
             Some(vec![&self.apply_column]),
         );
 
         let out = match &self.function {
-            Expr::Udf { function, .. } => {
+            Expr::Function { function, .. } => {
                 let mut df = gb.agg_list()?;
-                df.may_apply_at_idx(1, |s| function.call_udf(s.clone()))?;
+                df.may_apply_at_idx(1, |s| function.call_udf(&mut [s.clone()]))?;
                 Ok(df)
             }
             Expr::Agg(agg) => match agg {
@@ -109,14 +118,21 @@ impl PhysicalExpr for WindowExpr {
         drop(groups_lock);
 
         // 3. get the join tuples and use them to take the new Series
-        let out_column = out.select_at_idx(1).unwrap();
+        let out_column = out.select_at_idx(out.width() - 1).unwrap();
         let mut join_tuples_lock = state.join_tuples.lock().unwrap();
         let opt_join_tuples = match join_tuples_lock.get_mut(&key) {
             Some(t) => std::mem::take(t),
             None => {
-                // group key from right column
-                let right = out.select_at_idx(0).unwrap();
-                groupby_column.hash_join_left(right)
+                if groupby_columns.len() == 1 {
+                    // group key from right column
+                    let right = out.select_at_idx(0).unwrap();
+                    groupby_columns[0].hash_join_left(right)
+                } else {
+                    let df_right =
+                        DataFrame::new_no_checks(out.get_columns()[..out.width() - 1].to_vec());
+                    let df_left = DataFrame::new_no_checks(groupby_columns);
+                    private_left_join_multiple_keys(&df_left, &df_right)
+                }
             }
         };
 

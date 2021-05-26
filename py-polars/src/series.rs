@@ -20,6 +20,12 @@ pub struct ObjectValue {
     inner: PyObject,
 }
 
+impl PolarsObject for ObjectValue {
+    fn type_name() -> &'static str {
+        "object"
+    }
+}
+
 impl<'a> FromPyObject<'a> for ObjectValue {
     fn extract(ob: &'a PyAny) -> PyResult<Self> {
         let gil = Python::acquire_gil();
@@ -231,7 +237,7 @@ impl PySeries {
     pub fn get_object(&self, index: usize) -> PyObject {
         let gil = Python::acquire_gil();
         let python = gil.python();
-        if matches!(self.series.dtype(), DataType::Object) {
+        if matches!(self.series.dtype(), DataType::Object(_)) {
             // we don't use the null bitmap in this context as T::default is pyobject None
             let any = self.series.get_as_any(index);
             let obj: &ObjectValue = any.into();
@@ -556,7 +562,7 @@ impl PySeries {
             DataType::Duration(TimeUnit::Millisecond) => {
                 PyList::new(python, series.duration_millisecond().unwrap())
             }
-            DataType::Object => {
+            DataType::Object(_) => {
                 let v = PyList::empty(python);
                 for i in 0..series.len() {
                     let val = series
@@ -608,6 +614,8 @@ impl PySeries {
             "min" => FillNoneStrategy::Min,
             "max" => FillNoneStrategy::Max,
             "mean" => FillNoneStrategy::Mean,
+            "zero" => FillNoneStrategy::Zero,
+            "one" => FillNoneStrategy::One,
             s => return Err(PyPolarsEr::Other(format!("Strategy {} not supported", s)).into()),
         };
         let series = self.series.fill_none(strat).map_err(PyPolarsEr::from)?;
@@ -885,7 +893,10 @@ impl PySeries {
 
     pub fn str_slice(&self, start: i64, length: Option<u64>) -> PyResult<Self> {
         let ca = self.series.utf8().map_err(PyPolarsEr::from)?;
-        let s = ca.str_slice(start, length).map_err(PyPolarsEr::from)?.into_series();
+        let s = ca
+            .str_slice(start, length)
+            .map_err(PyPolarsEr::from)?
+            .into_series();
         Ok(s.into())
     }
 

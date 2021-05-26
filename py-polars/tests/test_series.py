@@ -203,7 +203,7 @@ def test_apply():
     b = a.apply(lambda x: x + "py")
     assert b == ["foopy", "barpy", None]
 
-    b = a.apply(lambda x: len(x), dtype_out=Int32)
+    b = a.apply(lambda x: len(x), return_dtype=Int32)
     assert b == [3, 3, None]
 
     b = a.apply(lambda x: len(x))
@@ -336,4 +336,4 @@ def test_arange_expr():
     df = pl.DataFrame({"a": ["foobar", "barfoo"]})
     out = df[[pl.arange(0, pl.col("a").count() * 10)]]
     assert out.shape == (20, 1)
-    assert out[0][-1] == 19
+    assert out.select_at_idx(0)[-1] == 19

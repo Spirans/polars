@@ -16,15 +16,16 @@ use std::{
 // reexport the lazy method
 pub use crate::frame::IntoLazy;
 
+/// A wrapper trait for any closure `Fn(Vec<Series>) -> Result<Series>`
 pub trait SeriesUdf: Send + Sync {
-    fn call_udf(&self, s: Series) -> Result<Series>;
+    fn call_udf(&self, s: &mut [Series]) -> Result<Series>;
 }
 
 impl<F> SeriesUdf for F
 where
-    F: Fn(Series) -> Result<Series> + Send + Sync,
+    F: Fn(&mut [Series]) -> Result<Series> + Send + Sync,
 {
-    fn call_udf(&self, s: Series) -> Result<Series> {
+    fn call_udf(&self, s: &mut [Series]) -> Result<Series> {
         self(s)
     }
 }
@@ -35,6 +36,7 @@ impl Debug for dyn SeriesUdf {
     }
 }
 
+/// A wrapper trait for any binary closure `Fn(Series, Series) -> Result<Series>`
 pub trait SeriesBinaryUdf: Send + Sync {
     fn call_udf(&self, a: Series, b: Series) -> Result<Series>;
 }
@@ -194,10 +196,16 @@ pub enum Expr {
         truthy: Box<Expr>,
         falsy: Box<Expr>,
     },
-    Udf {
-        input: Box<Expr>,
+    Function {
+        /// function arguments
+        input: Vec<Expr>,
+        /// function to apply
         function: NoEq<Arc<dyn SeriesUdf>>,
+        /// output dtype of the function
         output_type: Option<DataType>,
+        /// if the groups should aggregated to list before
+        /// execution of the function.
+        collect_groups: bool,
     },
     Shift {
         input: Box<Expr>,
@@ -215,7 +223,7 @@ pub enum Expr {
     Window {
         /// Also has the input. i.e. avg("foo")
         function: Box<Expr>,
-        partition_by: Box<Expr>,
+        partition_by: Vec<Expr>,
         order_by: Option<Box<Expr>>,
     },
     Wildcard,
@@ -313,7 +321,7 @@ impl fmt::Debug for Expr {
                 "\nWHEN {:?}\n\t{:?}\nOTHERWISE\n\t{:?}",
                 predicate, truthy, falsy
             ),
-            Udf { input, .. } => write!(f, "APPLY({:?})", input),
+            Function { input, .. } => write!(f, "APPLY({:?})", input),
             BinaryFunction {
                 input_a, input_b, ..
             } => write!(f, "BinaryFunction({:?}, {:?})", input_a, input_b),
@@ -561,7 +569,7 @@ impl Expr {
         if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
             panic!("wildcard not supperted in unique expr");
         }
-        self.map(|s: Series| s.unique(), None)
+        self.apply(|s: Series| s.unique(), None)
     }
 
     /// Get the first index of unique values of this expression.
@@ -569,8 +577,19 @@ impl Expr {
         if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
             panic!("wildcard not supported in unique expr");
         }
-        self.map(
+        self.apply(
             |s: Series| s.arg_unique().map(|ca| ca.into_series()),
+            Some(DataType::UInt32),
+        )
+    }
+
+    /// Get the index values that would sort this expression.
+    pub fn arg_sort(self, reverse: bool) -> Self {
+        if has_expr(&self, |e| matches!(e, Expr::Wildcard)) {
+            panic!("wildcard not supported in unique expr");
+        }
+        self.apply(
+            move |s: Series| Ok(s.argsort(reverse).into_series()),
             Some(DataType::UInt32),
         )
     }
@@ -607,16 +626,48 @@ impl Expr {
     }
 
     /// Apply a function/closure once the logical plan get executed.
+    ///
+    /// This function is very similar to [apply](Expr::apply), but differs in how it handles aggregations.
+    ///
+    ///  * `map` should be used for operations that are independent of groups, e.g. `multiply * 2`, or `raise to the power`
+    ///  * `apply` should be used for operations that work on a group of data. e.g. `sum`, `count`, etc.
+    ///
     /// It is the responsibility of the caller that the schema is correct by giving
     /// the correct output_type. If None given the output type of the input expr is used.
     pub fn map<F>(self, function: F, output_type: Option<DataType>) -> Self
     where
-        F: SeriesUdf + 'static,
+        F: Fn(Series) -> Result<Series> + 'static + Send + Sync,
     {
-        Expr::Udf {
-            input: Box::new(self),
-            function: NoEq::new(Arc::new(function)),
+        let f = move |s: &mut [Series]| function(std::mem::take(&mut s[0]));
+
+        Expr::Function {
+            input: vec![self],
+            function: NoEq::new(Arc::new(f)),
             output_type,
+            collect_groups: false,
+        }
+    }
+
+    /// Apply a function/closure over the groups. This should only be used in a groupby aggregation.
+    ///
+    /// It is the responsibility of the caller that the schema is correct by giving
+    /// the correct output_type. If None given the output type of the input expr is used.
+    ///
+    /// This difference with [map](Self::map) is that `apply` will create a separate `Series` per group.
+    ///
+    /// * `map` should be used for operations that are independent of groups, e.g. `multiply * 2`, or `raise to the power`
+    /// * `apply` should be used for operations that work on a group of data. e.g. `sum`, `count`, etc.
+    pub fn apply<F>(self, function: F, output_type: Option<DataType>) -> Self
+    where
+        F: Fn(Series) -> Result<Series> + 'static + Send + Sync,
+    {
+        let f = move |s: &mut [Series]| function(std::mem::take(&mut s[0]));
+
+        Expr::Function {
+            input: vec![self],
+            function: NoEq::new(Arc::new(f)),
+            output_type,
+            collect_groups: true,
         }
     }
 
@@ -699,17 +750,17 @@ impl Expr {
 
     /// Get an array with the cumulative sum computed at every element
     pub fn cum_sum(self, reverse: bool) -> Self {
-        self.map(move |s: Series| Ok(s.cum_sum(reverse)), None)
+        self.apply(move |s: Series| Ok(s.cum_sum(reverse)), None)
     }
 
     /// Get an array with the cumulative min computed at every element
     pub fn cum_min(self, reverse: bool) -> Self {
-        self.map(move |s: Series| Ok(s.cum_min(reverse)), None)
+        self.apply(move |s: Series| Ok(s.cum_min(reverse)), None)
     }
 
     /// Get an array with the cumulative max computed at every element
     pub fn cum_max(self, reverse: bool) -> Self {
-        self.map(move |s: Series| Ok(s.cum_max(reverse)), None)
+        self.apply(move |s: Series| Ok(s.cum_max(reverse)), None)
     }
 
     /// Apply window function over a subgroup.
@@ -733,7 +784,7 @@ impl Expr {
     ///      .lazy()
     ///      .select(&[
     ///          col("groups"),
-    ///          sum("values").over(col("groups")),
+    ///          sum("values").over(vec![col("groups")]),
     ///      ])
     ///      .collect()?;
     ///     dbg!(&out);
@@ -771,10 +822,10 @@ impl Expr {
     /// │ 1      ┆ 16     │
     /// ╰────────┴────────╯
     /// ```
-    pub fn over(self, partition_by: Expr) -> Self {
+    pub fn over(self, partition_by: Vec<Expr>) -> Self {
         Expr::Window {
             function: Box::new(self),
-            partition_by: Box::new(partition_by),
+            partition_by,
             order_by: None,
         }
     }

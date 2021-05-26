@@ -145,6 +145,10 @@ impl PyExpr {
         self.clone().inner.sort(reverse).into()
     }
 
+    pub fn arg_sort(&self, reverse: bool) -> PyExpr {
+        self.clone().inner.arg_sort(reverse).into()
+    }
+
     pub fn take(&self, idx: PyExpr) -> PyExpr {
         self.clone().inner.take(idx.inner).into()
     }
@@ -209,8 +213,9 @@ impl PyExpr {
         self.clone().inner.is_duplicated().into()
     }
 
-    pub fn over(&self, partition_by: PyExpr) -> PyExpr {
-        self.clone().inner.over(partition_by.inner).into()
+    pub fn over(&self, partition_by: Vec<PyExpr>) -> PyExpr {
+        let partition_by = partition_by.into_iter().map(|e| e.inner).collect();
+        self.clone().inner.over(partition_by).into()
     }
 
     pub fn _and(&self, expr: PyExpr) -> PyExpr {

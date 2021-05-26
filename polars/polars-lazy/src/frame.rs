@@ -1024,6 +1024,8 @@ impl LazyGroupBy {
         LazyFrame::from_logical_plan(lp, self.opt_state)
     }
 
+    /// Apply a function over the groups as a new `DataFrame`. It is not recommended that you use
+    /// this as materializing the `DataFrame` is quite expensive.
     pub fn apply<F>(self, f: F) -> LazyFrame
     where
         F: 'static + Fn(DataFrame) -> Result<DataFrame> + Send + Sync,
@@ -1041,7 +1043,7 @@ mod test {
     use polars_core::utils::chrono::{NaiveDate, NaiveDateTime, NaiveTime};
     use polars_core::*;
 
-    use crate::functions::pearson_corr;
+    use crate::functions::{argsort_by, pearson_corr};
     use crate::tests::get_df;
 
     use super::*;
@@ -1413,6 +1415,7 @@ mod test {
             .agg(vec![col("day").head(Some(2))])
             .collect()
             .unwrap();
+        dbg!(&out);
         let s = out
             .select_at_idx(1)
             .unwrap()
@@ -1681,13 +1684,13 @@ mod test {
         let _ = df
             .clone()
             .lazy()
-            .select(&[avg("values").over(col("groups")).alias("part")])
+            .select(&[avg("values").over(vec![col("groups")]).alias("part")])
             .collect()
             .unwrap();
         // test if partition aggregation is correct
         let out = df
             .lazy()
-            .select(&[col("groups"), sum("values").over(col("groups"))])
+            .select(&[col("groups"), sum("values").over(vec![col("groups")])])
             .collect()
             .unwrap();
         assert_eq!(
@@ -1999,25 +2002,168 @@ mod test {
     }
 
     #[test]
-    fn test_lazy_groupby_filter() {
+    fn test_lazy_groupby_filter() -> Result<()> {
         let df = df! {
             "a" => ["a", "a", "a", "b", "b", "c"],
             "b" => [1, 2, 3, 4, 5, 6]
-        }
-        .unwrap();
+        }?;
 
-        // test if it runs in groupby context
+        // We test if the filters work in the groupby context
+        // and that the aggregations can deal with empty sets
+
         let out = df
             .lazy()
             .groupby(vec![col("a")])
-            .agg(vec![col("b").filter(col("a").eq(lit("a"))).sum()])
+            .agg(vec![
+                col("b").filter(col("a").eq(lit("a"))).sum(),
+                col("b").filter(col("a").eq(lit("a"))).first(),
+                col("b").filter(col("a").eq(lit("e"))).mean(),
+                col("b").filter(col("a").eq(lit("a"))).last(),
+            ])
             .sort("a", false)
-            .collect()
-            .unwrap();
+            .collect()?;
 
         assert_eq!(
             Vec::from(out.column("b_sum").unwrap().i32().unwrap()),
-            [Some(6), Some(0), Some(0)]
+            [Some(6), None, None]
         );
+        assert_eq!(
+            Vec::from(out.column("b_first").unwrap().i32().unwrap()),
+            [Some(1), None, None]
+        );
+        assert_eq!(
+            Vec::from(out.column("b_mean").unwrap().f64().unwrap()),
+            [None, None, None]
+        );
+        assert_eq!(
+            Vec::from(out.column("b_last").unwrap().i32().unwrap()),
+            [Some(3), None, None]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_groupby_projection_pd_same_column() -> Result<()> {
+        // this query failed when projection pushdown was enabled
+
+        let a = || {
+            let df = df![
+                "col1" => ["a", "ab", "abc"],
+                "col2" => [1, 2, 3]
+            ]
+            .unwrap();
+
+            df.lazy()
+                .select(vec![col("col1").alias("foo"), col("col2").alias("bar")])
+        };
+
+        let out = a()
+            .left_join(a(), col("foo"), col("foo"), None)
+            .select(vec![col("bar")])
+            .collect()?;
+
+        let a = out.column("bar")?.i32()?;
+        assert_eq!(Vec::from(a), &[Some(1), Some(2), Some(3)]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_groupby_sort_slice() -> Result<()> {
+        let df = df![
+            "groups" => [1, 2, 2, 3, 3, 3],
+            "vals" => [1, 5, 6, 3, 9, 8]
+        ]?;
+        // get largest two values per groups
+
+        // expected:
+        // group      values
+        // 1          1
+        // 2          6, 5
+        // 3          9, 8
+
+        let out1 = df
+            .clone()
+            .lazy()
+            .sort("vals", true)
+            .groupby(vec![col("groups")])
+            .agg(vec![col("vals").head(Some(2)).alias("foo")])
+            .sort("groups", false)
+            .collect()?;
+
+        let out2 = df
+            .lazy()
+            .groupby(vec![col("groups")])
+            .agg(vec![col("vals").sort(true).head(Some(2)).alias("foo")])
+            .sort("groups", false)
+            .collect()?;
+
+        assert!(out1.column("foo")?.series_equal(out2.column("foo")?));
+        dbg!(out1, out2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_groupby_cumsum() -> Result<()> {
+        let df = df![
+            "groups" => [1, 2, 2, 3, 3, 3],
+            "vals" => [1, 5, 6, 3, 9, 8]
+        ]?;
+
+        let out = df
+            .lazy()
+            .groupby(vec![col("groups")])
+            .agg(vec![col("vals").cum_sum(false)])
+            .sort("groups", false)
+            .collect()?;
+
+        assert_eq!(
+            Vec::from(out.column("collected")?.explode()?.i32()?),
+            [1, 5, 11, 3, 12, 20]
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_argsort_multiple() -> Result<()> {
+        let df = df![
+            "int" => [1, 2, 3, 1, 2],
+            "flt" => [3.0, 2.0, 1.0, 2.0, 1.0],
+            "str" => ["a", "a", "a", "b", "b"]
+        ]?;
+
+        let out = df
+            .clone()
+            .lazy()
+            .select(vec![argsort_by(
+                vec![col("int"), col("flt")],
+                &[true, false],
+            )])
+            .collect()?;
+
+        assert_eq!(
+            Vec::from(out.column("int")?.u32()?),
+            [2, 4, 1, 3, 0]
+                .iter()
+                .copied()
+                .map(Some)
+                .collect::<Vec<_>>()
+        );
+
+        // check if this runs
+        let out = df
+            .lazy()
+            .select(vec![argsort_by(
+                vec![col("str"), col("flt")],
+                &[true, false],
+            )])
+            .collect()?;
+        Ok(())
     }
 }

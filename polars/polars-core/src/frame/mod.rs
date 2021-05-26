@@ -14,7 +14,7 @@ use crate::chunked_array::ops::unique::is_unique_helper;
 use crate::frame::select::Selection;
 use crate::prelude::*;
 use crate::utils::{
-    accumulate_dataframes_horizontal, accumulate_dataframes_vertical, get_supertype, NoNull,
+    accumulate_dataframes_horizontal, accumulate_dataframes_vertical, split_ca, split_df, NoNull,
 };
 
 mod arithmetic;
@@ -24,6 +24,8 @@ pub mod hash_join;
 pub mod row;
 pub mod select;
 mod upstream_traits;
+use crate::prelude::sort::prepare_argsort;
+use crate::POOL;
 
 #[derive(Clone)]
 pub struct DataFrame {
@@ -78,7 +80,7 @@ impl DataFrame {
     pub fn new<S: IntoSeries>(columns: Vec<S>) -> Result<Self> {
         let mut first_len = None;
         let mut series_cols = Vec::with_capacity(columns.len());
-        let mut names = HashSet::with_capacity_and_hasher(columns.len(), RandomState::default());
+        let mut names = HashSet::with_hasher(RandomState::default());
 
         // check for series length equality and convert into series in one pass
         for s in columns {
@@ -109,8 +111,13 @@ impl DataFrame {
         Ok(df)
     }
 
-    // doesn't check Series sizes.
-    // todo! make private
+    /// Create a new `DataFrame` but does not check the length or duplicate occurrence of the `Series`.
+    ///
+    /// It is adviced to use [Series::new](Series::new) in favor of this method.
+    ///
+    /// # Panic
+    /// It is the callers responsibility to uphold the contract of all `Series`
+    /// having an equal length, if not this may panic down the line.
     pub fn new_no_checks(columns: Vec<Series>) -> DataFrame {
         DataFrame { columns }
     }
@@ -573,6 +580,36 @@ impl DataFrame {
         }
     }
 
+    /// Does a filter but splits thread chunks vertically instead of horizontally
+    /// This yields a DataFrame with `n_chunks == n_threads`.
+    fn filter_vertical(&self, mask: &BooleanChunked) -> Result<Self> {
+        let n_threads = POOL.current_num_threads();
+
+        let masks = split_ca(mask, n_threads).unwrap();
+        let dfs = split_df(self, n_threads).unwrap();
+        let dfs: Result<Vec<_>> = POOL.install(|| {
+            masks
+                .par_iter()
+                .zip(dfs)
+                .map(|(mask, df)| {
+                    let cols = df
+                        .columns
+                        .iter()
+                        .map(|s| s.filter(mask))
+                        .collect::<Result<_>>()?;
+                    Ok(DataFrame::new_no_checks(cols))
+                })
+                .collect()
+        });
+
+        let mut iter = dfs?.into_iter();
+        let first = iter.next().unwrap();
+        Ok(iter.fold(first, |mut acc, df| {
+            acc.vstack_mut(&df).unwrap();
+            acc
+        }))
+    }
+
     /// Take DataFrame rows by a boolean mask.
     ///
     /// # Example
@@ -586,11 +623,19 @@ impl DataFrame {
     ///
     /// ```
     pub fn filter(&self, mask: &BooleanChunked) -> Result<Self> {
-        let new_col = self
-            .columns
-            .par_iter()
-            .map(|col| col.filter(mask))
-            .collect::<Result<Vec<_>>>()?;
+        if std::env::var("POLARS_VERT_PAR").is_ok() {
+            return self.filter_vertical(mask);
+        }
+
+        let new_col = POOL.install(|| {
+            self.columns
+                .par_iter()
+                .map(|s| match s.dtype() {
+                    DataType::Utf8 => s.filter_threaded(mask, true),
+                    _ => s.filter(mask),
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
         Ok(DataFrame::new_no_checks(new_col))
     }
 
@@ -633,23 +678,24 @@ impl DataFrame {
     where
         I: Iterator<Item = usize> + Clone + Sync,
     {
+        if std::env::var("POLARS_VERT_PAR").is_ok() {
+            let idx_ca: NoNull<UInt32Chunked> = iter.into_iter().map(|idx| idx as u32).collect();
+            return self.take_unchecked_vectical(&idx_ca.into_inner());
+        }
+
         let n_chunks = match self.n_chunks() {
             Err(_) => return self.clone(),
             Ok(n) => n,
         };
+        let has_utf8 = self
+            .columns
+            .iter()
+            .any(|s| matches!(s.dtype(), DataType::Utf8));
 
-        if n_chunks == 1 {
+        if n_chunks == 1 || has_utf8 {
             let idx_ca: NoNull<UInt32Chunked> = iter.into_iter().map(|idx| idx as u32).collect();
             let idx_ca = idx_ca.into_inner();
-            let cols = self
-                .columns
-                .par_iter()
-                .map(|s| {
-                    s.take_unchecked(&idx_ca)
-                        .expect("already checked single chunk")
-                })
-                .collect();
-            return DataFrame::new_no_checks(cols);
+            return self.take_unchecked(&idx_ca);
         }
 
         let new_col = self
@@ -677,22 +723,24 @@ impl DataFrame {
     where
         I: Iterator<Item = Option<usize>> + Clone + Sync,
     {
+        if std::env::var("POLARS_VERT_PAR").is_ok() {
+            let idx_ca: UInt32Chunked = iter.into_iter().map(|opt| opt.map(|v| v as u32)).collect();
+            return self.take_unchecked_vectical(&idx_ca);
+        }
+
         let n_chunks = match self.n_chunks() {
             Err(_) => return self.clone(),
             Ok(n) => n,
         };
 
-        if n_chunks == 1 {
+        let has_utf8 = self
+            .columns
+            .iter()
+            .any(|s| matches!(s.dtype(), DataType::Utf8));
+
+        if n_chunks == 1 || has_utf8 {
             let idx_ca: UInt32Chunked = iter.into_iter().map(|opt| opt.map(|v| v as u32)).collect();
-            let cols = self
-                .columns
-                .par_iter()
-                .map(|s| {
-                    s.take_unchecked(&idx_ca)
-                        .expect("already checked single chunk")
-                })
-                .collect();
-            return DataFrame::new_no_checks(cols);
+            return self.take_unchecked(&idx_ca);
         }
 
         let new_col = self
@@ -730,9 +778,55 @@ impl DataFrame {
         } else {
             Cow::Borrowed(indices)
         };
-        let new_col = self.columns.par_iter().map(|s| s.take(&indices)).collect();
+        let new_col = POOL.install(|| {
+            self.columns
+                .par_iter()
+                .map(|s| match s.dtype() {
+                    DataType::Utf8 => s.take_threaded(&indices, true),
+                    _ => s.take(&indices),
+                })
+                .collect()
+        });
 
         DataFrame::new_no_checks(new_col)
+    }
+
+    unsafe fn take_unchecked(&self, idx: &UInt32Chunked) -> Self {
+        let cols = POOL.install(|| {
+            self.columns
+                .par_iter()
+                .map(|s| match s.dtype() {
+                    DataType::Utf8 => s.take_unchecked_threaded(&idx, true).unwrap(),
+                    _ => s.take_unchecked(&idx).unwrap(),
+                })
+                .collect()
+        });
+        DataFrame::new_no_checks(cols)
+    }
+
+    unsafe fn take_unchecked_vectical(&self, indices: &UInt32Chunked) -> Self {
+        let n_threads = POOL.current_num_threads();
+        let idxs = split_ca(&indices, n_threads).unwrap();
+
+        let dfs: Vec<_> = POOL.install(|| {
+            idxs.par_iter()
+                .map(|idx| {
+                    let cols = self
+                        .columns
+                        .iter()
+                        .map(|s| s.take_unchecked(idx).unwrap())
+                        .collect();
+                    DataFrame::new_no_checks(cols)
+                })
+                .collect()
+        });
+
+        let mut iter = dfs.into_iter();
+        let first = iter.next().unwrap();
+        iter.fold(first, |mut acc, df| {
+            acc.vstack_mut(&df).unwrap();
+            acc
+        })
     }
 
     /// Rename a column in the DataFrame
@@ -761,54 +855,18 @@ impl DataFrame {
     }
 
     /// This is the dispatch of Self::sort, and exists to reduce compile bloat by monomorphization.
-    fn sort_impl(&self, by_column: Vec<&str>, mut reverse: Vec<bool>) -> Result<Self> {
+    fn sort_impl(&self, by_column: Vec<&str>, reverse: Vec<bool>) -> Result<Self> {
         let take = match by_column.len() {
             1 => {
                 let s = self.column(by_column[0])?;
                 s.argsort(reverse[0])
             }
-            n_cols => {
+            _ => {
                 #[cfg(feature = "sort_multiple")]
                 {
-                    let mut columns = self.select_series(by_column)?;
+                    let columns = self.select_series(by_column)?;
 
-                    // we only allow this implementation of the same types
-                    // se we determine the supertypes and coerce all series.
-                    let mut first = columns.remove(0);
-                    let dtype = if first.utf8().is_ok() {
-                        Some(DataType::Float64)
-                    } else {
-                        columns.iter().try_fold::<_, _, Result<_>>(None, |acc, s| {
-                            let acc = match (&acc, s.dtype()) {
-                                (_, DataType::Utf8) => acc,
-                                (None, dt) => Some(dt.clone()),
-                                (Some(acc), dt) => Some(get_supertype(acc, dt)?),
-                            };
-                            Ok(acc)
-                        })?
-                    };
-
-                    if let Some(dtype) = dtype {
-                        columns = columns
-                            .into_iter()
-                            .map(|s| match s.dtype() {
-                                DataType::Utf8 => s,
-                                _ => s.cast_with_dtype(&dtype).expect("supertype is known"),
-                            })
-                            .collect::<Vec<_>>();
-
-                        // broadcast ordering
-                        if n_cols > reverse.len() && reverse.len() == 1 {
-                            while n_cols != reverse.len() {
-                                reverse.push(reverse[0]);
-                            }
-                        }
-
-                        if !matches!(first.dtype(), DataType::Utf8) {
-                            first = first.cast_with_dtype(&dtype)?;
-                        }
-                    }
-
+                    let (first, columns, reverse) = prepare_argsort(columns, reverse)?;
                     first.argsort_multiple(&columns, &reverse)?
                 }
                 #[cfg(not(feature = "sort_multiple"))]
@@ -817,6 +875,9 @@ impl DataFrame {
                 }
             }
         };
+        if std::env::var("POLARS_VERT_PAR").is_ok() {
+            return Ok(unsafe { self.take_unchecked_vectical(&take) });
+        }
         Ok(self.take(&take))
     }
 

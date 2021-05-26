@@ -43,10 +43,10 @@ fn groupby_helper(
 
     let groups = gb.get_groups();
 
-    let mut columns = gb.keys();
+    let (mut columns, agg_columns) = POOL.install(|| {
+        let get_columns = || gb.keys();
 
-    let agg_columns = POOL.install(|| {
-        aggs
+        let get_agg = || aggs
             .par_iter()
             .map(|expr| {
                 let agg_expr = expr.as_agg_expr()?;
@@ -62,17 +62,22 @@ fn groupby_helper(
                 };
                 Ok(opt_agg)
             })
-            .collect::<Result<Vec<_>>>()
-    })?;
+            .collect::<Result<Vec<_>>>();
+
+        rayon::join(get_columns, get_agg)
+    });
+    let agg_columns = agg_columns?;
 
     columns.extend(agg_columns.into_iter().flatten());
-
     let df = DataFrame::new_no_checks(columns);
     Ok(df)
 }
 
 impl Executor for GroupByExec {
     fn execute(&mut self, state: &ExecutionState) -> Result<DataFrame> {
+        if state.verbose {
+            eprintln!("aggregates are not partitionable: running default HASH AGGREGATION")
+        }
         let df = self.input.execute(state)?;
         let keys = self
             .keys
@@ -86,7 +91,7 @@ impl Executor for GroupByExec {
 /// Take an input Executor and a multiple expressions
 pub struct PartitionGroupByExec {
     input: Box<dyn Executor>,
-    keys: Vec<Arc<dyn PhysicalExpr>>,
+    key: Arc<dyn PhysicalExpr>,
     phys_aggs: Vec<Arc<dyn PhysicalExpr>>,
     aggs: Vec<Expr>,
 }
@@ -94,17 +99,101 @@ pub struct PartitionGroupByExec {
 impl PartitionGroupByExec {
     pub(crate) fn new(
         input: Box<dyn Executor>,
-        keys: Vec<Arc<dyn PhysicalExpr>>,
+        key: Arc<dyn PhysicalExpr>,
         phys_aggs: Vec<Arc<dyn PhysicalExpr>>,
         aggs: Vec<Expr>,
     ) -> Self {
         Self {
             input,
-            keys,
+            key,
             phys_aggs,
             aggs,
         }
     }
+}
+
+fn run_partitions(
+    df: &DataFrame,
+    exec: &PartitionGroupByExec,
+    state: &ExecutionState,
+    n_threads: usize,
+) -> Result<Vec<DataFrame>> {
+    // We do a partitioned groupby.
+    // Meaning that we first do the groupby operation arbitrarily
+    // splitted on several threads. Than the final result we apply the same groupby again.
+    let dfs = split_df(df, n_threads)?;
+
+    POOL.install(|| {
+        dfs.into_par_iter()
+            .map(|df| {
+                let key = exec.key.evaluate(&df, state)?;
+                let phys_aggs = &exec.phys_aggs;
+                let gb = df.groupby_with_series(vec![key], false)?;
+                let groups = gb.get_groups();
+
+                let mut columns = gb.keys();
+                let agg_columns = phys_aggs
+                    .par_iter()
+                    .map(|expr| {
+                        let agg_expr = expr.as_agg_expr()?;
+                        let opt_agg = agg_expr.evaluate_partitioned(&df, groups, state)?;
+                        if let Some(agg) = &opt_agg {
+                            if agg[0].len() != groups.len() {
+                                panic!(
+                                    "returned aggregation is a different length: {} than the group lengths: {}",
+                                    agg.len(),
+                                    groups.len()
+                                )
+                            }
+                        };
+                        Ok(opt_agg)
+                    }).collect::<Result<Vec<_>>>()?;
+
+                columns.extend(agg_columns.into_iter().flatten().map(|v| v.into_iter()).flatten());
+
+                let df = DataFrame::new_no_checks(columns);
+                Ok(df)
+            })
+    }).collect()
+}
+
+#[allow(clippy::type_complexity)]
+fn get_outer_agg_exprs(
+    exec: &PartitionGroupByExec,
+    df: &DataFrame,
+) -> Result<(Vec<(Node, Arc<String>)>, Vec<Arc<dyn PhysicalExpr>>)> {
+    // Due to the PARTITIONED GROUPBY the column names are be changed.
+    // To make sure sure we can select the columns with the new names, we re-create the physical
+    // aggregations with new root column names (being the output of the partitioned aggregation)j
+    // We also keep a hold on the output names to rename the final aggregation.
+    let mut expr_arena = Arena::with_capacity(32);
+    let schema = df.schema();
+    let aggs_and_names = exec
+        .aggs
+        .iter()
+        .map(|e| {
+            let out_field = e.to_field(&schema, Context::Aggregation)?;
+            let out_name = Arc::new(out_field.name().clone());
+            let node = to_aexpr(e.clone(), &mut expr_arena);
+            rename_aexpr_root_name(node, &mut expr_arena, out_name.clone())?;
+            Ok((node, out_name))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let planner = DefaultPlanner {};
+
+    let outer_phys_aggs = aggs_and_names
+        .iter()
+        .map(|(e, _)| planner.create_physical_expr(*e, Context::Aggregation, &mut expr_arena))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok((aggs_and_names, outer_phys_aggs))
+}
+
+fn sample_cardinality(key: &Series, sample_size: usize) -> f32 {
+    let offset = (key.len() / 2) as i64;
+    let s = key.slice(offset, sample_size);
+    s.n_unique().unwrap() as f32 / s.len() as f32
 }
 
 impl Executor for PartitionGroupByExec {
@@ -115,126 +204,87 @@ impl Executor for PartitionGroupByExec {
         // If the column is a categorical, we know the number of groups we have and can decide to continue
         // partitioned or go for the standard groupby. The partitioned is likely to be faster on a small number
         // of groups.
-        let keys = self
-            .keys
-            .iter()
-            .map(|e| e.evaluate(&original_df, state))
-            .collect::<Result<Vec<_>>>()?;
+        let key = self.key.evaluate(&original_df, state)?;
 
-        debug_assert_eq!(keys.len(), 1);
-        let s = &keys[0];
-        if let Ok(ca) = s.categorical() {
+        if std::env::var("POLARS_NO_PARTITION").is_ok() {
+            if state.verbose {
+                eprintln!("POLARS_NO_PARTITION set: running default HASH AGGREGATION")
+            }
+            return groupby_helper(original_df, vec![key], &self.phys_aggs, None, state);
+        }
+
+        let cardinality_frac = std::env::var("POLARS_PARTITION_CARDINALITY_FRAC")
+            .map(|s| s.parse::<f32>().unwrap())
+            .unwrap_or(0.1f32);
+
+        let (frac, a) = if let Ok(ca) = key.categorical() {
             let cat_map = ca
                 .get_categorical_map()
                 .expect("categorical type has categorical_map");
-            let frac = cat_map.len() as f32 / ca.len() as f32;
-            // TODO! proper benchmark which boundary should be chosen.
-            if frac > 0.3 {
-                return groupby_helper(original_df, keys, &self.phys_aggs, None, state);
-            }
+
+            (cat_map.len() as f32 / ca.len() as f32, "known")
+        } else {
+            let sample_size = std::env::var("POLARS_PARTITION_SAMPLE_SIZE")
+                .map(|s| s.parse::<usize>().unwrap())
+                .unwrap_or(1250usize);
+            (sample_cardinality(&key, sample_size), "estimated")
+        };
+        if state.verbose {
+            eprintln!("{} cardinality: {}%", a, (frac * 100.0) as u32);
         }
-        let mut expr_arena = Arena::with_capacity(64);
 
-        // This will be the aggregation on the partition results. Due to the groupby
-        // operation the column names have changed. This makes sure we can select the columns with
-        // the new names. We also keep a hold on the names to make sure that we don't get a double
-        // new name due to the double aggregation. These output_names will be used to rename the final
-        // output
-        let schema = original_df.schema();
-        let aggs_and_names = self
-            .aggs
-            .iter()
-            .map(|e| {
-                let out_field = e.to_field(&schema, Context::Aggregation)?;
-                let out_name = Arc::new(out_field.name().clone());
-                let node = to_aexpr(e.clone(), &mut expr_arena);
-                rename_aexpr_root_name(node, &mut expr_arena, out_name.clone())?;
-                Ok((node, out_name))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        if frac > cardinality_frac {
+            if state.verbose {
+                eprintln!(
+                    "estimated cardinality is > than allowed cardinality: {}\
+                running default HASH AGGREGATION",
+                    (cardinality_frac * 100.0) as u32
+                );
+            }
+            return groupby_helper(original_df, vec![key], &self.phys_aggs, None, state);
+        }
+        if state.verbose {
+            eprintln!("run PARTITIONED HASH AGGREGATION")
+        }
 
-        let planner = DefaultPlanner {};
-        let outer_phys_aggs = aggs_and_names
-            .iter()
-            .map(|(e, _)| planner.create_physical_expr(*e, Context::Aggregation, &mut expr_arena))
-            .collect::<Result<Vec<_>>>()?;
-
+        // Run the partitioned aggregations
         let n_threads = num_cpus::get();
-        // We do a partitioned groupby. Meaning that we first do the groupby operation arbitrarily
-        // splitted on several threads. Than the final result we apply the same groupby again.
-        let dfs = split_df(&original_df, n_threads)?;
+        let dfs = run_partitions(&original_df, self, state, n_threads)?;
 
-        let dfs = POOL.install(|| {
-            dfs.into_par_iter()
-                .map(|df| {
-                    let keys = self
-                        .keys
-                        .iter()
-                        .map(|e| e.evaluate(&df, state))
-                        .collect::<Result<Vec<_>>>()?;
-                    let phys_aggs = &self.phys_aggs;
-                    let gb = df.groupby_with_series(keys, false)?;
-                    let groups = gb.get_groups();
-
-                    let mut columns = gb.keys();
-                    let agg_columns = phys_aggs
-                        .iter()
-                        .map(|expr| {
-                            let agg_expr = expr.as_agg_expr()?;
-                            let opt_agg = agg_expr.evaluate_partitioned(&df, groups, state)?;
-                            if let Some(agg) = &opt_agg {
-                                if agg[0].len() != groups.len() {
-                                    panic!(
-                                        "returned aggregation is a different length: {} than the group lengths: {}",
-                                        agg.len(),
-                                        groups.len()
-                                    )
-                                }
-                            };
-                            Ok(opt_agg)
-                        }).collect::<Result<Vec<_>>>()?;
-
-                    for agg in agg_columns.into_iter().flatten() {
-                        for agg in agg {
-                            columns.push(agg)
-                        }
-                    }
-
-                    let df = DataFrame::new_no_checks(columns);
-                    Ok(df)
-                })
-        }).collect::<Result<Vec<_>>>()?;
-
+        // MERGE phase
+        // merge and hash aggregate again
         let df = accumulate_dataframes_vertical(dfs)?;
+        let key = self.key.evaluate(&df, state)?;
 
-        let keys = self
-            .keys
-            .iter()
-            .map(|e| e.evaluate(&df, state))
-            .collect::<Result<Vec<_>>>()?;
-
-        // do the same on the outer results
-        let gb = df.groupby_with_series(keys, true)?;
+        let gb = df.groupby_with_series(vec![key], true)?;
         let groups = gb.get_groups();
 
-        let mut columns = gb.keys();
-        let agg_columns = outer_phys_aggs
-            .iter()
-            .zip(aggs_and_names.iter().map(|(_, name)| name))
-            .filter_map(|(expr, name)| {
-                let agg_expr = expr.as_agg_expr().unwrap();
-                // If None the column doesn't exist anymore.
-                // For instance when summing a string this column will not be in the aggregation result
-                let opt_agg = agg_expr.evaluate_partitioned_final(&df, groups, state).ok();
-                opt_agg.map(|opt_s| {
-                    opt_s.map(|mut s| {
-                        s.rename(name);
-                        s
+        let (aggs_and_names, outer_phys_aggs) = get_outer_agg_exprs(self, &original_df)?;
+
+        let get_columns = || gb.keys();
+        let get_agg = || {
+            outer_phys_aggs
+                .par_iter()
+                .zip(aggs_and_names.par_iter().map(|(_, name)| name))
+                .filter_map(|(expr, name)| {
+                    let agg_expr = expr.as_agg_expr().unwrap();
+                    // If None the column doesn't exist anymore.
+                    // For instance when summing a string this column will not be in the aggregation result
+                    let opt_agg = agg_expr.evaluate_partitioned_final(&df, groups, state).ok();
+                    opt_agg.map(|opt_s| {
+                        opt_s.map(|mut s| {
+                            s.rename(name);
+                            s
+                        })
                     })
                 })
-            });
+                .flatten()
+                .collect()
+        };
+        let (mut columns, agg_columns): (Vec<_>, Vec<_>) =
+            POOL.install(|| rayon::join(get_columns, get_agg));
 
-        columns.extend(agg_columns.flatten());
+        columns.extend(agg_columns);
 
         let df = DataFrame::new_no_checks(columns);
         Ok(df)

@@ -70,10 +70,11 @@ pub enum AExpr {
         truthy: Node,
         falsy: Node,
     },
-    Udf {
-        input: Node,
+    Function {
+        input: Vec<Node>,
         function: NoEq<Arc<dyn SeriesUdf>>,
         output_type: Option<DataType>,
+        collect_groups: bool,
     },
     Shift {
         input: Node,
@@ -81,7 +82,7 @@ pub enum AExpr {
     },
     Window {
         function: Node,
-        partition_by: Node,
+        partition_by: Vec<Node>,
         order_by: Option<Node>,
     },
     Wildcard,
@@ -289,12 +290,12 @@ impl AExpr {
                 Ok(Field::new(field.name(), data_type.clone()))
             }
             Ternary { truthy, .. } => arena.get(*truthy).to_field(schema, ctxt, arena),
-            Udf {
+            Function {
                 output_type, input, ..
             } => match output_type {
-                None => arena.get(*input).to_field(schema, ctxt, arena),
+                None => arena.get(input[0]).to_field(schema, ctxt, arena),
                 Some(output_type) => {
-                    let input_field = arena.get(*input).to_field(schema, ctxt, arena)?;
+                    let input_field = arena.get(input[0]).to_field(schema, ctxt, arena)?;
                     Ok(Field::new(input_field.name(), output_type.clone()))
                 }
             },

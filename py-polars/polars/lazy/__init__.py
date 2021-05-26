@@ -1,3 +1,7 @@
+"""
+This module contains all expressions and classes needed for lazy computation/ query execution.
+"""
+
 from typing import Union, List, Callable, Optional, Dict, Any
 
 from polars import Series
@@ -9,6 +13,7 @@ import tempfile
 import subprocess
 import shutil
 from datetime import datetime
+import numpy as np
 
 try:
     from ..polars import (
@@ -19,6 +24,7 @@ try:
         binary_function as pybinary_function,
         pearson_corr as pypearson_corr,
         cov as pycov,
+        argsort_by as pyargsort_by,
         PyExpr,
         PyLazyGroupBy,
         when as pywhen,
@@ -54,18 +60,55 @@ def wrap_ldf(ldf: "PyLazyFrame") -> "LazyFrame":
 
 
 class LazyGroupBy:
+    """
+    Created by `df.lazy().groupby("foo)"`
+    """
+
     def __init__(self, lgb: "PyLazyGroupBy"):
         self.lgb = lgb
 
     def agg(self, aggs: "Union[List[Expr], Expr]") -> "LazyFrame":
+        """
+        Describe the aggregation that need to be done on a group.
+
+        Parameters
+        ----------
+        aggs
+            Single/ Multiple aggregation expression(s)
+
+        # Example
+
+        ```python
+        (pl.scan_csv("data.csv")
+            .groupby("groups")
+            .agg([
+                    pl.col("name").n_unique().alias("unique_names"),
+                    pl.max("values")
+                ])
+        )
+        ```
+        """
         aggs = _selection_to_pyexpr_list(aggs)
         return wrap_ldf(self.lgb.agg(aggs))
 
     def apply(self, f: "Callable[[DataFrame], DataFrame]") -> "LazyFrame":
+        """
+        Apply a function over the groups as a new `DataFrame`. It is not recommended that you use
+        this as materializing the `DataFrame` is quite expensive.
+
+        Parameters
+        ----------
+        f
+            Function to apply over the `DataFrame`
+        """
         return wrap_ldf(self.lgb.apply(f))
 
 
 class LazyFrame:
+    """
+    Representation of a Lazy computation graph/ query.
+    """
+
     def __init__(self):
         self._ldf = None
 
@@ -85,7 +128,11 @@ class LazyFrame:
         stop_after_n_rows: "Optional[int]" = None,
         cache: bool = True,
         dtype: "Optional[Dict[str, DataType]]" = None,
+        low_memory: bool = False,
     ):
+        """
+        See Also: `pl.scan_csv`
+        """
         if dtype is not None:
             new_dtype = []
             for k, v in dtype.items():
@@ -102,6 +149,7 @@ class LazyFrame:
             stop_after_n_rows,
             cache,
             dtype,
+            low_memory,
         )
         return self
 
@@ -109,6 +157,9 @@ class LazyFrame:
     def scan_parquet(
         file: str, stop_after_n_rows: "Optional[int]" = None, cache: bool = True
     ):
+        """
+        See Also: `pl.scan_parquet`
+        """
 
         self = LazyFrame.__new__(LazyFrame)
         self._ldf = PyLazyFrame.new_from_parquet(file, stop_after_n_rows, cache)
@@ -130,7 +181,27 @@ class LazyFrame:
         return func(self, *args, **kwargs)
 
     def describe_plan(self) -> str:
+        """
+        A string representation on of the NOT optimized query plan
+        """
         return self._ldf.describe_plan()
+
+    def describe_optimized_plan(
+        self,
+        type_coercion: bool = True,
+        predicate_pushdown: bool = True,
+        projection_pushdown: bool = True,
+        simplify_expression: bool = True,
+    ) -> str:
+        """
+        A string representation on of the optimized query plan
+        """
+
+        ldf = self._ldf.optimization_toggle(
+            type_coercion, predicate_pushdown, projection_pushdown, simplify_expression
+        )
+
+        return ldf.describe_optimized_plan()
 
     def show_graph(
         self,
@@ -183,20 +254,6 @@ class LazyFrame:
                 plt.imshow(img)
                 plt.show()
 
-    def describe_optimized_plan(
-        self,
-        type_coercion: bool = True,
-        predicate_pushdown: bool = True,
-        projection_pushdown: bool = True,
-        simplify_expression: bool = True,
-    ) -> str:
-
-        ldf = self._ldf.optimization_toggle(
-            type_coercion, predicate_pushdown, projection_pushdown, simplify_expression
-        )
-
-        return ldf.describe_optimized_plan()
-
     def sort(
         self,
         by_columns: "Union[str, Expr, List[Expr]]",
@@ -231,7 +288,7 @@ class LazyFrame:
         predicate_pushdown: bool = True,
         projection_pushdown: bool = True,
         simplify_expression: bool = True,
-        string_cache: bool = True,
+        string_cache: bool = False,
         no_optimization: bool = False,
     ) -> DataFrame:
         """
@@ -250,6 +307,10 @@ class LazyFrame:
         string_cache
             Use a global string cache in this query.
             This is needed if you want to join on categorical columns.
+
+            Caution!
+                If you already have set a global string cache, set this to `False` as this will reset the
+                global cache when the query is finished.
         no_optimization
             Turn off optimizations
 
@@ -328,7 +389,7 @@ class LazyFrame:
         self,
     ) -> "LazyFrame":
         """
-        Cache the result once Physical plan hits this node.
+        Cache the result once the execution of the physical plan hits this node.
         """
         return wrap_ldf(self._ldf.cache())
 
@@ -721,6 +782,10 @@ def wrap_expr(pyexpr: "PyExpr") -> "Expr":
 
 
 class Expr:
+    """
+    Expressions that can be used in various contexts
+    """
+
     def __init__(self):
         self._pyexpr = None
 
@@ -803,30 +868,63 @@ class Expr:
         return wrap_expr(self._pyexpr.lt(other._pyexpr))
 
     def alias(self, name: str) -> "Expr":
+        """
+        Rename the output of an expression.
+
+        Parameters
+        ----------
+        name
+            new name
+        """
         return wrap_expr(self._pyexpr.alias(name))
 
     def is_not(self) -> "Expr":
+        """
+        Negate a boolean expression.
+        """
         return wrap_expr(self._pyexpr.is_not())
 
     def is_null(self) -> "Expr":
+        """
+        Create a boolean expression returning `True` where the expression contains null values.
+        """
         return wrap_expr(self._pyexpr.is_null())
 
     def is_not_null(self) -> "Expr":
+        """
+        Create a boolean expression returning `True` where the expression not contains null values.
+        """
         return wrap_expr(self._pyexpr.is_not_null())
 
     def is_finite(self) -> "Expr":
+        """
+        Create a boolean expression returning `True` where the expression values are finite.
+        """
         return wrap_expr(self._pyexpr.is_finite())
 
     def is_infinite(self) -> "Expr":
+        """
+        Create a boolean expression returning `True` where the expression values are infinite.
+        """
         return wrap_expr(self._pyexpr.is_infinite())
 
     def is_nan(self) -> "Expr":
+        """
+        Create a boolean expression returning `True` where the expression values are NaN (Not A Number).
+        """
         return wrap_expr(self._pyexpr.is_nan())
 
     def is_not_nan(self) -> "Expr":
+        """
+        Create a boolean expression returning `True` where the expression values are not NaN (Not A Number).
+        """
         return wrap_expr(self._pyexpr.is_not_nan())
 
     def agg_groups(self) -> "Expr":
+        """
+        Get the group indexes of the group by operation.
+        Should be used in aggregation context only.
+        """
         return wrap_expr(self._pyexpr.agg_groups())
 
     def count(self) -> "Expr":
@@ -880,6 +978,14 @@ class Expr:
         return wrap_expr(self._pyexpr.cum_max(reverse))
 
     def cast(self, dtype: "DataType") -> "Expr":
+        """
+        Cast an expression to a different data type.
+
+        Parameters
+        ----------
+        dtype
+            Output data type
+        """
         if dtype == str:
             dtype = datatypes.Utf8
         elif dtype == bool:
@@ -902,6 +1008,23 @@ class Expr:
             True -> order from large to small
         """
         return wrap_expr(self._pyexpr.sort(reverse))
+
+    def arg_sort(self, reverse: bool = False) -> "Expr":
+        """
+        Get the index values that would sort this column.
+
+        Parameters
+        ----------
+        reverse
+            False -> order from small to large
+            True -> order from large to small
+
+        Returns
+        -------
+        out
+            Series of type UInt32
+        """
+        return wrap_expr(self._pyexpr.arg_sort(reverse))
 
     def sort_by(self, by: "Union[Expr, str]", reverse: bool = False) -> "Expr":
         """
@@ -966,7 +1089,7 @@ class Expr:
     def fill_none(self, fill_value: "Union[str, int, float, Expr]") -> "Expr":
         if not isinstance(fill_value, Expr):
             fill_value = lit(fill_value)
-        return wrap_expr(self._pyexpr.fill_none(fill_value))
+        return wrap_expr(self._pyexpr.fill_none(fill_value._pyexpr))
 
     def reverse(self) -> "Expr":
         """
@@ -1046,7 +1169,7 @@ class Expr:
         """
         return wrap_expr(self._pyexpr.list())
 
-    def over(self, expr: "Union[str, Expr]") -> "Expr":
+    def over(self, expr: "Union[str, Expr, List[Expr]]") -> "Expr":
         """
         Apply window function over a subgroup.
         This is similar to a groupby + aggregation + self join.
@@ -1055,7 +1178,7 @@ class Expr:
         Parameters
         ----------
         expr
-            Expression that evaluates to a column of groups
+            Column(s) to group by.
 
         Examples
         --------
@@ -1104,10 +1227,10 @@ class Expr:
 
         ```
         """
-        if isinstance(expr, str):
-            expr = col(expr)
 
-        return wrap_expr(self._pyexpr.over(expr._pyexpr))
+        pyexprs = _selection_to_pyexpr_list(expr)
+
+        return wrap_expr(self._pyexpr.over(pyexprs))
 
     def is_unique(self) -> "Expr":
         """
@@ -1345,7 +1468,7 @@ class Expr:
     def map(
         self,
         f: "Union[UDF, Callable[[Series], Series]]",
-        dtype_out: Optional["DataType"] = None,
+        return_dtype: Optional["DataType"] = None,
     ) -> "Expr":
         """
         Apply a custom UDF. It is important that the UDF returns a Polars Series.
@@ -1356,26 +1479,26 @@ class Expr:
         ----------
         f
             lambda/ function to apply
-        dtype_out
+        return_dtype
             dtype of the output Series
         """
         if isinstance(f, UDF):
-            dtype_out = f.output_type
+            return_dtype = f.return_dtype
             f = f.f
-        if dtype_out == str:
-            dtype_out = datatypes.Utf8
-        elif dtype_out == int:
-            dtype_out = datatypes.Int64
-        elif dtype_out == float:
-            dtype_out = datatypes.Float64
-        elif dtype_out == bool:
-            dtype_out = datatypes.Boolean
-        return wrap_expr(self._pyexpr.map(f, dtype_out))
+        if return_dtype == str:
+            return_dtype = datatypes.Utf8
+        elif return_dtype == int:
+            return_dtype = datatypes.Int64
+        elif return_dtype == float:
+            return_dtype = datatypes.Float64
+        elif return_dtype == bool:
+            return_dtype = datatypes.Boolean
+        return wrap_expr(self._pyexpr.map(f, return_dtype))
 
     def apply(
         self,
         f: "Union[UDF, Callable[[Series], Series]]",
-        dtype_out: Optional["DataType"] = None,
+        return_dtype: Optional["DataType"] = None,
     ) -> "Expr":
         """
         Apply a custom UDF in a GroupBy context. This is syntactic sugar for the `apply` method which operates on all
@@ -1385,7 +1508,7 @@ class Expr:
         ----------
         f
             lambda/ function to apply
-        dtype_out
+        return_dtype
             dtype of the output Series
 
         # Example
@@ -1422,7 +1545,7 @@ class Expr:
 
         # input x: Series of type list containing the group values
         def wrap_f(x: "Series") -> "Series":
-            return x.apply(f, dtype_out=dtype_out)
+            return x.apply(f, return_dtype=return_dtype)
 
         return self.map(wrap_f)
 
@@ -1525,19 +1648,37 @@ def expr_to_lit_or_expr(
 
 
 class WhenThen:
+    """
+    Utility class. See the `when` function.
+    """
+
     def __init__(self, pywhenthen: "PyWhenThen"):  # noqa F821
         self._pywhenthen = pywhenthen
 
     def otherwise(self, expr: "Union[Expr, int, float, str]") -> "Expr":
+        """
+        Values to return in case of the predicate being `False`
+
+        See Also: the `when` function.
+        """
         expr = expr_to_lit_or_expr(expr)
         return wrap_expr(self._pywhenthen.otherwise(expr._pyexpr))
 
 
 class When:
+    """
+    Utility class. See the `when` function.
+    """
+
     def __init__(self, pywhen: "pywhen"):  # noqa F821
         self._pywhen = pywhen
 
     def then(self, expr: "Union[Expr, int, float, str]") -> WhenThen:
+        """
+        Values to return in case of the predicate being `True`
+
+        See Also: the `when` function.
+        """
         expr = expr_to_lit_or_expr(expr)
         whenthen = self._pywhen.then(expr._pyexpr)
         return WhenThen(whenthen)
@@ -1811,9 +1952,19 @@ def lit_date(dt: "datetime") -> Expr:
     return lit(int(dt.timestamp() * 1e3))
 
 
-def lit(value: "Optional[Union[float, int, str, datetime, Series]]") -> "Expr":
+def lit(
+    value: "Optional[Union[float, int, str, datetime, Series]]",
+    dtype: "Optional[DataType]" = None,
+) -> "Expr":
     """
     A literal value
+
+    Parameters
+    ----------
+    value
+        Value that should be used as a `literal`
+    dtype
+        Optionally define a dtype
 
     # Example
 
@@ -1838,8 +1989,15 @@ def lit(value: "Optional[Union[float, int, str, datetime, Series]]") -> "Expr":
         return lit(int(value.timestamp() * 1e3)).cast(datatypes.Date64)
 
     if isinstance(value, Series):
+        name = value.name
         value = value._s
+        return wrap_expr(pylit(value)).alias(name)
 
+    if isinstance(value, np.ndarray):
+        return lit(Series("", value))
+
+    if dtype:
+        return wrap_expr(pylit(value)).cast(dtype)
     return wrap_expr(pylit(value))
 
 
@@ -1889,7 +2047,7 @@ def map_binary(
     a: "Union[str, Expr]",
     b: "Union[str, Expr]",
     f: Callable[[Series, Series], Series],
-    output_type: "Optional[DataType]" = None,
+    return_dtype: "Optional[DataType]" = None,
 ) -> "Expr":
     """
     Map a custom function over two columns and produce a single Series result.
@@ -1902,14 +2060,14 @@ def map_binary(
         Input Series b
     f
         Function to apply
-    output_type
+    return_dtype
         Output type of the udf
     """
     if isinstance(a, str):
         a = col(a)
     if isinstance(b, str):
         b = col(b)
-    return wrap_expr(pybinary_function(a._pyexpr, b._pyexpr, f, output_type))
+    return wrap_expr(pybinary_function(a._pyexpr, b._pyexpr, f, return_dtype))
 
 
 def fold(acc: Expr, f: Callable[[Series, Series], Series], exprs: List[Expr]) -> Expr:
@@ -1952,21 +2110,34 @@ def all(name: "Union[str, List[Expr]]") -> "Expr":
 
 
 def groups(column: str) -> "Expr":
-    return col(column).groups()
+    """
+    Syntactic sugar for `column("foo").agg_groups()`
+    """
+    return col(column).agg_groups()
 
 
 def quantile(column: str, quantile: float) -> "Expr":
+    """
+    Syntactic sugar for `column("foo").quantile(..)`
+    """
     return col(column).quantile(quantile)
 
 
 class UDF:
-    def __init__(self, f: Callable[[Series], Series], output_type: "DataType"):
+    """
+    Deprecated: don't use me
+    """
+
+    def __init__(self, f: Callable[[Series], Series], return_dtype: "DataType"):
         self.f = f
-        self.output_type = output_type
+        self.return_dtype = return_dtype
 
 
-def udf(f: Callable[[Series], Series], output_type: "DataType"):
-    return UDF(f, output_type)
+def udf(f: Callable[[Series], Series], return_dtype: "DataType"):
+    """
+    Deprecated: don't use me
+    """
+    return UDF(f, return_dtype)
 
 
 def arange(low: int, high: int, dtype: "Optional[DataType]" = None) -> "Expr":
@@ -2010,8 +2181,30 @@ def arange(low: int, high: int, dtype: "Optional[DataType]" = None) -> "Expr":
             assert s2.len() == 1
             return Series._from_pyseries(_series_from_range(s1[0], s2[0], dtype))
 
-        return map_binary(low, high, create_range, output_type=dtype)
+        return map_binary(low, high, create_range, return_dtype=dtype)
 
     if dtype is None:
         dtype = datatypes.Int64
     return wrap_expr(pyrange(low, high, dtype))
+
+
+def argsort_by(
+    exprs: "List[Expr]", reverse: "Union[List[bool], bool]" = False
+) -> "Expr":
+    """
+    Find the indexes that would sort the columns.
+
+    Argsort by multiple columns. The first column will be used for the ordering.
+    If there are duplicates in the first column, the second column will be used to determine the ordering
+    and so on.
+    Parameters
+    ----------
+    exprs
+        Columns use to determine the ordering
+    reverse
+        default is ascending
+    """
+    if not isinstance(reverse, list):
+        reverse = [reverse]
+    exprs = _selection_to_pyexpr_list(exprs)
+    return wrap_expr(pyargsort_by(exprs, reverse))

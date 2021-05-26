@@ -2,7 +2,7 @@ use crate::physical_plan::state::ExecutionState;
 use crate::physical_plan::PhysicalAggregation;
 use crate::prelude::*;
 use polars_core::frame::groupby::GroupTuples;
-use polars_core::prelude::*;
+use polars_core::{prelude::*, POOL};
 use std::sync::Arc;
 
 pub struct BinaryExpr {
@@ -65,52 +65,6 @@ impl PhysicalExpr for BinaryExpr {
     }
 }
 
-impl PhysicalAggregation for BinaryFunctionExpr {
-    fn aggregate(
-        &self,
-        df: &DataFrame,
-        groups: &GroupTuples,
-        state: &ExecutionState,
-    ) -> Result<Option<Series>> {
-        let a = self.input_a.evaluate(df, state)?;
-        let b = self.input_b.evaluate(df, state)?;
-
-        let agg_a = a.agg_list(groups).expect("no data?");
-        let agg_b = b.agg_list(groups).expect("no data?");
-
-        // keep track of the output lengths. If they are all unit length,
-        // we can explode the array as it would have the same length as the no. of groups
-        // if it is not all unit length it should remain a listarray
-
-        let mut all_unit_length = true;
-
-        let ca = agg_a
-            .list()
-            .unwrap()
-            .into_iter()
-            .zip(agg_b.list().unwrap())
-            .map(|(opt_a, opt_b)| match (opt_a, opt_b) {
-                (Some(a), Some(b)) => {
-                    let out = self.function.call_udf(a, b).ok();
-
-                    if let Some(s) = &out {
-                        if s.len() != 1 {
-                            all_unit_length = false;
-                        }
-                    }
-                    out
-                }
-                _ => None,
-            })
-            .collect::<ListChunked>();
-
-        if all_unit_length {
-            return Ok(Some(ca.explode()?));
-        }
-        Ok(Some(ca.into_series()))
-    }
-}
-
 impl PhysicalAggregation for BinaryExpr {
     fn aggregate(
         &self,
@@ -120,22 +74,37 @@ impl PhysicalAggregation for BinaryExpr {
     ) -> Result<Option<Series>> {
         match (self.left.as_agg_expr(), self.right.as_agg_expr()) {
             (Ok(left), Err(_)) => {
-                let opt_agg = left.aggregate(df, groups, state)?;
-                let rhs = self.right.evaluate(df, state)?;
-                opt_agg
-                    .map(|agg| apply_operator(&agg, &rhs, self.op))
+                let (opt_agg, rhs) = POOL.install(|| {
+                    rayon::join(
+                        || left.aggregate(df, groups, state),
+                        || self.right.evaluate(df, state),
+                    )
+                });
+                opt_agg?
+                    .map(|agg| apply_operator(&agg, &rhs?, self.op))
                     .transpose()
             }
             (Err(_), Ok(right)) => {
-                let opt_agg = right.aggregate(df, groups, state)?;
-                let lhs = self.left.evaluate(df, state)?;
-                opt_agg
-                    .map(|agg| apply_operator(&lhs, &agg, self.op))
+                let (opt_agg, lhs) = POOL.install(|| {
+                    rayon::join(
+                        || right.aggregate(df, groups, state),
+                        || self.left.evaluate(df, state),
+                    )
+                });
+
+                opt_agg?
+                    .map(|agg| apply_operator(&lhs?, &agg, self.op))
                     .transpose()
             }
             (Ok(left), Ok(right)) => {
-                let right_agg = right.aggregate(df, groups, state)?;
-                left.aggregate(df, groups, state)?
+                let (left_agg, right_agg) = POOL.install(|| {
+                    rayon::join(
+                        || left.aggregate(df, groups, state),
+                        || right.aggregate(df, groups, state),
+                    )
+                });
+                let right_agg = right_agg?;
+                left_agg?
                     .and_then(|left| right_agg.map(|right| apply_operator(&left, &right, self.op)))
                     .transpose()
             }

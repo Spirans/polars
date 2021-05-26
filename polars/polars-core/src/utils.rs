@@ -727,7 +727,7 @@ extern "C" {
 
 /// Simple wrapper to parallelize functions that can be divided over threads aggregated and
 /// finally aggregated in the main thread. This can be done for sum, min, max, etc.
-pub fn parallel_op<F>(f: F, s: Series, n_threads: Option<usize>) -> Result<Series>
+pub fn parallel_op_series<F>(f: F, s: Series, n_threads: Option<usize>) -> Result<Series>
 where
     F: Fn(Series) -> Result<Series> + Send + Sync,
 {
@@ -883,4 +883,27 @@ impl<T> IntoVec<T> for Vec<T> {
     fn into_vec(self) -> Self {
         self
     }
+}
+
+/// This logic is same as the impl on ChunkedArray
+/// The difference is that there is less indirection because the caller should preallocate
+/// `chunk_lens` once. On the `ChunkedArray` we indicrect through an `ArrayRef` which is an indirection
+/// and a vtable.
+#[inline]
+pub(crate) fn index_to_chunked_index<I: Iterator<Item = usize>>(
+    chunk_lens: I,
+    index: usize,
+) -> (usize, usize) {
+    let mut index_remainder = index;
+    let mut current_chunk_idx = 0;
+
+    for chunk_len in chunk_lens {
+        if chunk_len > index_remainder {
+            break;
+        } else {
+            index_remainder -= chunk_len;
+            current_chunk_idx += 1;
+        }
+    }
+    (current_chunk_idx, index_remainder)
 }

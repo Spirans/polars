@@ -4,8 +4,8 @@ use crate::prelude::*;
 use polars_arrow::array::ValueSize;
 use polars_core::chunked_array::builder::get_list_builder;
 use polars_core::frame::groupby::{fmt_groupby_column, GroupByMethod, GroupTuples};
-use polars_core::prelude::*;
 use polars_core::utils::NoNull;
+use polars_core::{prelude::*, POOL};
 use std::sync::Arc;
 
 pub(crate) struct AggregationExpr {
@@ -140,12 +140,15 @@ impl PhysicalAggregation for AggregationExpr {
                 let mut new_name = fmt_groupby_column(series.name(), self.agg_type);
                 let agg_s = series.agg_sum(groups);
 
-                if let Some(mut agg_s) = agg_s {
+                // If the aggregation is successful,
+                // we also count the valid values (len - null count)
+                // this is needed to compute the final mean.
+                if let Some(agg_s) = agg_s {
+                    // we expect f64 from mean, so we already cast
+                    let mut agg_s = agg_s.cast_with_dtype(&DataType::Float64)?;
                     agg_s.rename(&new_name);
                     new_name.push_str("__POLARS_MEAN_COUNT");
-                    let ca: NoNull<UInt32Chunked> =
-                        groups.iter().map(|t| t.1.len() as u32).collect();
-                    let mut count_s = ca.into_inner().into_series();
+                    let mut count_s = series.agg_valid_count(groups).unwrap();
                     count_s.rename(&new_name);
                     Ok(Some(vec![agg_s, count_s]))
                 } else {
@@ -178,9 +181,10 @@ impl PhysicalAggregation for AggregationExpr {
                 let count_name = format!("{}__POLARS_MEAN_COUNT", series.name());
                 let new_name = fmt_groupby_column(series.name(), self.agg_type);
                 let count = final_df.column(&count_name).unwrap();
-                // divide by the count
-                let series = &series / count;
-                let agg_s = series.agg_sum(groups);
+
+                let (agg_count, agg_s) =
+                    POOL.join(|| count.agg_sum(groups), || series.agg_sum(groups));
+                let agg_s = agg_s.map(|agg_s| &agg_s / &agg_count.unwrap());
                 Ok(rename_option_series(agg_s, &new_name))
             }
             GroupByMethod::List => {
@@ -209,6 +213,7 @@ impl PhysicalAggregation for AggregationExpr {
         }
     }
 }
+
 impl PhysicalAggregation for AggQuantileExpr {
     fn aggregate(
         &self,
@@ -240,37 +245,6 @@ impl PhysicalAggregation for CastExpr {
         opt_agg
             .map(|agg| agg.cast_with_dtype(&self.data_type))
             .transpose()
-    }
-}
-
-impl PhysicalAggregation for ApplyExpr {
-    fn aggregate(
-        &self,
-        df: &DataFrame,
-        groups: &GroupTuples,
-        state: &ExecutionState,
-    ) -> Result<Option<Series>> {
-        match self.input.as_agg_expr() {
-            // layer below is also an aggregation expr.
-            Ok(expr) => {
-                let aggregated = expr.aggregate(df, groups, state)?;
-                let out = aggregated.map(|s| self.function.call_udf(s));
-                out.transpose()
-            }
-            Err(_) => {
-                let series = self.input.evaluate(df, state)?;
-                series
-                    .agg_list(groups)
-                    .map(|s| {
-                        let s = self.function.call_udf(s);
-                        s.map(|mut s| {
-                            s.rename(series.name());
-                            s
-                        })
-                    })
-                    .map_or(Ok(None), |v| v.map(Some))
-            }
-        }
     }
 }
 
